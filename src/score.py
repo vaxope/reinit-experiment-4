@@ -1,0 +1,406 @@
+"""Score a run and summarize it: generations.jsonl -> scored.jsonl + summary.json + summary.md.
+
+Purpose : the only place where correctness is decided. Reads raw generation records
+          (never modifies them), applies src/extract.py, and computes every metric of the
+          control run per mode, plus a paired comparison for every pair of modes.
+Inputs  : runs/<run>/generations.jsonl (schema: src/schema.py / CLAUDE.md "Logging"),
+          configs/control.toml [scoring] and [prompt].
+Outputs : in the same folder (or --out-dir):
+          scored.jsonl  - each input record + extracted_answer, extraction_rule, correct,
+                          extraction_detail, outcome, truncated, scoring_rule_version, and the
+                          lenient reading beside it: lenient_answer, lenient_correct, lenient_detail
+          summary.json  - all metrics, machine-readable (the viewer can also recompute them)
+          summary.md    - the same as a readable table
+Pipeline: (later) generate.py on DeltaAI -> copy back -> [score] -> viewer/index.html, vault note.
+
+Usage:  python3 -m src.score runs/<run>/generations.jsonl [--overwrite]
+
+Every record is counted. Errors, truncations and unreadable lines are reported, never skipped.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+from src import extract
+from src.config import load_config
+from src.schema import missing_fields
+
+# Outcome of one record, in the order they are checked. Exactly one applies.
+OUTCOMES = ("error", "truncated", "no_answer", "wrong", "correct")
+
+
+# ---------------------------------------------------------------- reading
+def read_jsonl(path: Path) -> tuple[list[dict], list[dict]]:
+    """Return (records, corrupt). A line that is not valid JSON is kept as a 'corrupt'
+    entry with its line number, so a damaged log is visible in the summary."""
+    records, corrupt = [], []
+    with path.open(encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                corrupt.append({"line": lineno, "error": str(e)})
+    return records, corrupt
+
+
+def latest_per_key(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Keep the LAST record per (run_id, qid, sample_idx, mode). Earlier ones exist only when a
+    failed request was re-sent (generate.py --retry-errors); they are returned so the summary
+    can list them. The raw log itself is never edited."""
+    last = {}
+    for i, r in enumerate(records):
+        last[(r.get("run_id"), r.get("qid"), r.get("sample_idx"), r.get("mode"))] = i
+    keep = set(last.values())
+    return [r for i, r in enumerate(records) if i in keep], [r for i, r in enumerate(records) if i not in keep]
+
+
+def run_timing(meta_path: Path) -> dict | None:
+    """GPU time from generate.py's run_meta.jsonl: sum of (end - start) over job segments.
+    Concurrent requests overlap, so this (not the sum of per-request wall times) is the GPU time."""
+    if not meta_path.exists():
+        return None
+    starts, segs, toks, gpus, interrupted, stalled = {}, [], 0, 1, 0, 0
+    with meta_path.open() as f:
+        events = [json.loads(l) for l in f if l.strip()]
+    from datetime import datetime
+    for e in events:
+        if e["event"] == "start":
+            starts[e.get("slurm_job_id")] = datetime.fromisoformat(e["time"])
+            g = str(e.get("gpus") or "1")
+            gpus = len(g.split(",")) if "," in g else (int(g) if g.isdigit() else 1)
+        elif e["event"] == "end" and e.get("slurm_job_id") in starts:
+            segs.append((datetime.fromisoformat(e["time"]) - starts.pop(e.get("slurm_job_id"))).total_seconds())
+            toks += e.get("output_tokens", 0)
+            stalled += bool(e.get("stalled"))
+            interrupted += bool(e.get("interrupted")) and not e.get("stalled")
+    total = sum(segs)
+    return {"segments": len(segs), "interrupted_segments": interrupted, "stalled_segments": stalled,
+            "unfinished_segments": len(starts), "elapsed_s": total,
+            "gpus": gpus, "gpu_hours": total * gpus / 3600,
+            "aggregate_output_tokens_per_s": toks / total if total else None}
+
+
+# ---------------------------------------------------------------- scoring one record
+def score_record(rec: dict, cfg: dict) -> dict:
+    """Return a copy of rec with the score fields added. Decision order = OUTCOMES."""
+    n_opt = cfg["prompt"]["n_options"]
+    out = dict(rec)
+    truncated = rec.get("finish_reason") == "length"  # hit max_new_tokens
+    if rec.get("error") or rec.get("output_text") is None:
+        detail = {"letter": None, "rule": "generation_error", "n_answer_fields": 0, "n_strict_fields": 0,
+                  "strict_letter": None, "n_near_misses": 0, "think_closed": None, "analysis_closed": None}
+    else:
+        detail = extract.extract_answer(rec["output_text"], rec["mode"], n_opt)
+    letter = detail["letter"]
+
+    if detail["rule"] == "generation_error":
+        outcome = "error"
+    elif truncated and cfg["scoring"]["truncated_counts_as_wrong"]:
+        outcome = "truncated"
+    elif letter is None:
+        outcome = "no_answer"
+    else:
+        outcome = "correct" if letter == rec.get("gold") else "wrong"
+
+    # Lenient reading (beside the official rule): any answer anywhere in the output. Same
+    # truncation and error handling as the official outcome.
+    if rec.get("error") or rec.get("output_text") is None:
+        lenient = {"letter": None, "rule": "generation_error", "n_answers": 0, "kind": None}
+    else:
+        lenient = extract.extract_lenient(rec["output_text"], n_opt)
+    lenient_ok = (lenient["letter"] is not None and lenient["letter"] == rec.get("gold")
+                  and not (truncated and cfg["scoring"]["truncated_counts_as_wrong"]))
+    out.update({
+        "lenient_answer": lenient["letter"],
+        "lenient_correct": lenient_ok,
+        "lenient_detail": lenient,
+        "extracted_answer": letter,          # what the extractor found (kept even if truncated)
+        "extraction_rule": detail["rule"],   # which branch of the rule decided it
+        "correct": outcome == "correct",
+        "extraction_detail": detail,
+        "outcome": outcome,
+        "truncated": truncated,
+        "scoring_rule_version": cfg["scoring"]["extraction_rule"],
+    })
+    return out
+
+
+# ---------------------------------------------------------------- statistics helpers
+def z_value(level: float) -> float:
+    """Two-sided normal quantile, e.g. 0.95 -> 1.96."""
+    return statistics.NormalDist().inv_cdf(0.5 + level / 2)
+
+
+def wilson_ci(k: int, n: int, level: float) -> tuple[float, float]:
+    """Wilson score interval for k successes in n independent trials. Better than
+    p +/- z*sqrt(p(1-p)/n) near 0 or 1 and for small n; never leaves [0, 1]."""
+    if n == 0:
+        return (math.nan, math.nan)
+    z, p = z_value(level), k / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def clustered_ci(per_question: list[float], level: float) -> tuple[float, float]:
+    """CI when there are several samples per question: samples of the same question are
+    correlated, so treat each QUESTION's mean accuracy as one observation (n = #questions)."""
+    n = len(per_question)
+    if n < 2:
+        return (math.nan, math.nan)
+    m, sd = statistics.fmean(per_question), statistics.stdev(per_question)
+    half = z_value(level) * sd / math.sqrt(n)
+    return (max(0.0, m - half), min(1.0, m + half))
+
+
+def describe(values: list[float]) -> dict:
+    """n, mean, median, p95, min, max, total of a numeric list (None values excluded)."""
+    v = sorted(x for x in values if x is not None)
+    if not v:
+        return {"n": 0}
+    def pct(q):  # linear interpolation between closest ranks
+        i = (len(v) - 1) * q
+        lo, hi = math.floor(i), math.ceil(i)
+        return v[lo] + (v[hi] - v[lo]) * (i - lo)
+    return {"n": len(v), "mean": statistics.fmean(v), "median": pct(0.5), "p95": pct(0.95),
+            "min": v[0], "max": v[-1], "total": sum(v)}
+
+
+def mcnemar_exact(b: int, c: int) -> float:
+    """Exact two-sided McNemar p-value: under 'no difference', each discordant pair is
+    equally likely to favour either mode, so min(b, c) ~ Binomial(b + c, 0.5)."""
+    n = b + c
+    if n == 0:
+        return 1.0
+    tail = sum(math.comb(n, k) for k in range(min(b, c) + 1)) / 2 ** n
+    return min(1.0, 2 * tail)
+
+
+# ---------------------------------------------------------------- summary
+def summarize_mode(recs: list[dict], level: float) -> dict:
+    n = len(recs)
+    n_correct = sum(r["correct"] for r in recs)
+    by_q = defaultdict(list)
+    for r in recs:
+        by_q[r.get("qid")].append(1.0 if r["correct"] else 0.0)
+    max_samples = max((len(v) for v in by_q.values()), default=0)
+    if max_samples <= 1:
+        ci, method = wilson_ci(n_correct, n, level), "wilson"
+    else:
+        ci, method = clustered_ci([statistics.fmean(v) for v in by_q.values()], level), "clustered_by_question"
+    # Lenient accuracy (beside the official one), same denominator and CI method.
+    n_len = sum(bool(r.get("lenient_correct")) for r in recs)
+    by_q_len = defaultdict(list)
+    for r in recs:
+        by_q_len[r.get("qid")].append(1.0 if r.get("lenient_correct") else 0.0)
+    ci_len = (wilson_ci(n_len, n, level) if max_samples <= 1
+              else clustered_ci([statistics.fmean(v) for v in by_q_len.values()], level))
+
+    out_tok = [r.get("n_output_tokens") for r in recs]
+    think_tok = [r.get("n_think_tokens") for r in recs]
+    analysis_tok = [r.get("n_analysis_tokens") for r in recs]
+    # Visible = output minus the reasoning block (think block or analysis block).
+    visible_tok = [(r["n_output_tokens"] - (r.get("n_think_tokens") or 0) - (r.get("n_analysis_tokens") or 0))
+                   if r.get("n_output_tokens") is not None else None for r in recs]
+    tok_per_s = [r["n_output_tokens"] / r["wall_time_s"] for r in recs
+                 if r.get("n_output_tokens") and r.get("wall_time_s")]
+    return {
+        "n_records": n,
+        "n_questions": len(by_q),
+        "samples_per_question_max": max_samples,
+        "n_correct": n_correct,
+        "accuracy": n_correct / n if n else math.nan,  # denominator = ALL records, incl. errors/truncations
+        "ci": list(ci), "ci_method": method, "ci_level": level,
+        "n_correct_lenient": n_len,
+        "accuracy_lenient": n_len / n if n else math.nan,
+        "ci_lenient": list(ci_len),
+        # Not truncated, no error, and still no answer of any shape.
+        "n_no_answer_lenient": sum(r.get("lenient_answer") is None and r["outcome"] not in ("truncated", "error")
+                                   for r in recs),
+        "outcomes": dict(Counter(r["outcome"] for r in recs)),
+        "extraction_rules": dict(Counter(r["extraction_rule"] for r in recs)),
+        # Format failures: answered, but not in the requested "answer": "X" form.
+        # Strict rule v2 for comparison: correct only if the strict "answer": "X" field was used
+        # (same truncation rule). Shows how much of the accuracy depends on the wider v3 fields.
+        "n_correct_strict_v2": sum(r["outcome"] == "correct"
+                                   and r["extraction_detail"].get("strict_letter") == r.get("gold") for r in recs),
+        "n_near_miss_only": sum(r["extraction_rule"] == "no_answer_field"
+                                and r["extraction_detail"].get("n_near_misses", 0) > 0 for r in recs),
+        # Letter bias check: the prompt's example is "C"; a model that over-picks C shows here.
+        "extracted_letter_counts": dict(sorted(Counter(r["extracted_answer"] for r in recs
+                                                       if r["extracted_answer"]).items())),
+        "gold_letter_counts": dict(sorted(Counter(r.get("gold") for r in recs if r.get("gold")).items())),
+        "finish_reasons": dict(Counter(str(r.get("finish_reason")) for r in recs)),
+        "truncation_rate": sum(r["truncated"] for r in recs) / n if n else math.nan,
+        "n_errors": sum(r["outcome"] == "error" for r in recs),
+        "tokens_output": describe(out_tok),
+        "tokens_think": describe(think_tok),
+        "tokens_analysis": describe(analysis_tok),
+        "tokens_visible": describe(visible_tok),
+        "tokens_input": describe([r.get("n_input_tokens") for r in recs]),
+        "tokens_output_when_correct": describe([r.get("n_output_tokens") for r in recs if r["correct"]]),
+        "tokens_output_when_not_correct": describe([r.get("n_output_tokens") for r in recs if not r["correct"]]),
+        "wall_time_s": describe([r.get("wall_time_s") for r in recs]),
+        # Per-request decode speed. With many concurrent requests, total GPU time is NOT the
+        # sum of wall times; GPU-hours need the run's start/end time (from generate.py, later).
+        "output_tokens_per_s_per_request": describe(tok_per_s),
+    }
+
+
+def paired_all(scored: list[dict], modes: list[str]) -> list[dict]:
+    """One paired comparison per pair of modes, in config order (think-default,
+    think-reinit, default-reinit)."""
+    return [p for i, a in enumerate(modes) for b in modes[i + 1:] if (p := paired(scored, [a, b]))]
+
+
+def paired(scored: list[dict], modes: list[str]) -> dict | None:
+    """Mode a vs mode b on the SAME (qid, sample_idx): same question, same option order."""
+    if len(modes) != 2:
+        return None
+    a, b = modes
+    cell = {(r.get("qid"), r.get("sample_idx"), r["mode"]): r["correct"] for r in scored}
+    keys = {(q, s) for (q, s, m) in cell}
+    both = [(cell[(q, s, a)], cell[(q, s, b)]) for (q, s) in keys
+            if (q, s, a) in cell and (q, s, b) in cell]
+    only_a = sum(x and not y for x, y in both)
+    only_b = sum(y and not x for x, y in both)
+    return {"modes": [a, b], "n_pairs": len(both),
+            "both_correct": sum(x and y for x, y in both),
+            f"only_{a}_correct": only_a, f"only_{b}_correct": only_b,
+            "both_wrong": sum(not x and not y for x, y in both),
+            "mcnemar_exact_p": mcnemar_exact(only_a, only_b),
+            "note": "pairs share qid and sample_idx; with >1 sample per question, pairs are not independent"}
+
+
+def summarize(scored: list[dict], corrupt: list[dict], cfg: dict, source: str,
+              superseded: list[dict] | None = None, timing: dict | None = None) -> dict:
+    level = cfg["scoring"]["ci_level"]
+    modes = [m for m in cfg["prompt"]["modes"] if any(r.get("mode") == m for r in scored)]
+    unknown_modes = sorted({str(r.get("mode")) for r in scored} - set(cfg["prompt"]["modes"]))
+    dup = Counter((r.get("run_id"), r.get("qid"), r.get("mode"), r.get("sample_idx")) for r in scored)
+    schema = Counter(f for r in scored for f in missing_fields(r))
+    return {
+        "source": source,
+        "run_ids": sorted({str(r.get("run_id")) for r in scored}),
+        "n_records": len(scored),
+        "corrupt_lines": corrupt,
+        "duplicate_keys": sum(c - 1 for c in dup.values() if c > 1),
+        "superseded_records": [{"qid": r.get("qid"), "sample_idx": r.get("sample_idx"), "mode": r.get("mode"),
+                                "error": r.get("error")} for r in (superseded or [])],
+        "run_timing": timing,
+        "missing_schema_fields": dict(schema),
+        "unknown_modes": unknown_modes,
+        "scoring": {"rule": cfg["scoring"]["extraction_rule"], "lenient_rule": cfg["scoring"]["lenient_rule"],
+                    "truncated_counts_as_wrong": cfg["scoring"]["truncated_counts_as_wrong"],
+                    "config_sha256": cfg["_meta"]["sha256"]},
+        "per_mode": {m: summarize_mode([r for r in scored if r["mode"] == m], level) for m in modes},
+        "paired": paired_all(scored, modes),
+    }
+
+
+def fmt(x, nd=1):
+    return "–" if x is None or (isinstance(x, float) and math.isnan(x)) else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
+
+
+def to_markdown(s: dict) -> str:
+    """A readable table of the summary. Every number comes from summary.json."""
+    modes = list(s["per_mode"])
+    pm = s["per_mode"]
+    def row(label, f):
+        return f"| {label} | " + " | ".join(f(pm[m]) for m in modes) + " |"
+    lines = [
+        f"# Summary: {', '.join(s['run_ids'])}",
+        "",
+        f"Source `{s['source']}` · {s['n_records']} records · rule `{s['scoring']['rule']}` · "
+        f"truncated counts as wrong: {s['scoring']['truncated_counts_as_wrong']}",
+        "",
+        "| metric | " + " | ".join(modes) + " |",
+        "|---|" + "---|" * len(modes),
+        row("accuracy", lambda d: f"{d['accuracy']:.3f} [{fmt(d['ci'][0], 3)}, {fmt(d['ci'][1], 3)}] ({d['ci_method']})"),
+        row("correct / records", lambda d: f"{d['n_correct']} / {d['n_records']}"),
+        row(f"accuracy, lenient ({s['scoring'].get('lenient_rule', '–')}: any answer anywhere)",
+            lambda d: f"{d['accuracy_lenient']:.3f} [{fmt(d['ci_lenient'][0], 3)}, {fmt(d['ci_lenient'][1], 3)}] ({d['n_correct_lenient']} / {d['n_records']})" if "accuracy_lenient" in d else "–"),
+        row("no answer of any shape (lenient, not truncated)", lambda d: str(d.get("n_no_answer_lenient", "–"))),
+        row("correct under strict v2 (\"answer\": \"X\" only)", lambda d: f"{d.get('n_correct_strict_v2', '–')} / {d['n_records']}"),
+        row("questions × max samples", lambda d: f"{d['n_questions']} × {d['samples_per_question_max']}"),
+        row("outcomes", lambda d: ", ".join(f"{k} {v}" for k, v in sorted(d["outcomes"].items()))),
+        row("extraction rules", lambda d: ", ".join(f"{k} {v}" for k, v in sorted(d["extraction_rules"].items()))),
+        row("no field, but a look-alike answer", lambda d: str(d["n_near_miss_only"])),
+        row("extracted letters (gold)", lambda d: ", ".join(f"{k} {v}" for k, v in d["extracted_letter_counts"].items()) + " (" + ", ".join(f"{k} {v}" for k, v in d["gold_letter_counts"].items()) + ")"),
+        row("finish reasons", lambda d: ", ".join(f"{k} {v}" for k, v in sorted(d["finish_reasons"].items()))),
+        row("truncation rate", lambda d: fmt(d["truncation_rate"], 3)),
+        row("output tokens mean / median / p95 / max", lambda d: " / ".join(fmt(d["tokens_output"].get(k), 0) for k in ("mean", "median", "p95", "max"))),
+        row("think tokens mean / median", lambda d: " / ".join(fmt(d["tokens_think"].get(k), 0) for k in ("mean", "median"))),
+        row("analysis tokens mean / median", lambda d: " / ".join(fmt(d.get("tokens_analysis", {}).get(k), 0) for k in ("mean", "median"))),
+        row("visible tokens mean / median", lambda d: " / ".join(fmt(d["tokens_visible"].get(k), 0) for k in ("mean", "median"))),
+        row("output tokens total", lambda d: fmt(d["tokens_output"].get("total"), 0)),
+        row("output tokens mean: correct vs not", lambda d: f"{fmt(d['tokens_output_when_correct'].get('mean'), 0)} vs {fmt(d['tokens_output_when_not_correct'].get('mean'), 0)}"),
+        row("input tokens mean", lambda d: fmt(d["tokens_input"].get("mean"), 0)),
+        row("wall time s mean / median / max", lambda d: " / ".join(fmt(d["wall_time_s"].get(k), 1) for k in ("mean", "median", "max"))),
+        row("tokens/s per request (median)", lambda d: fmt(d["output_tokens_per_s_per_request"].get("median"), 1)),
+    ]
+    for p in s["paired"] or []:
+        a, b = p["modes"]
+        lines += ["", f"**Paired ({a} vs {b}, {p['n_pairs']} pairs):** both correct {p['both_correct']} · "
+                  f"only {a} {p[f'only_{a}_correct']} · only {b} {p[f'only_{b}_correct']} · both wrong {p['both_wrong']} · "
+                  f"exact McNemar p = {p['mcnemar_exact_p']:.3g}. _{p['note']}._"]
+    problems = []
+    if s["corrupt_lines"]: problems.append(f"{len(s['corrupt_lines'])} unreadable lines")
+    if s["duplicate_keys"]: problems.append(f"{s['duplicate_keys']} duplicate (run, qid, mode, sample) keys")
+    if s.get("superseded_records"): problems.append(f"{len(s['superseded_records'])} earlier failed attempts superseded by a retry (listed in summary.json)")
+    if s["missing_schema_fields"]: problems.append(f"missing schema fields: {s['missing_schema_fields']}")
+    if s["unknown_modes"]: problems.append(f"records with unknown modes: {s['unknown_modes']}")
+    t = s.get("run_timing")
+    if t:
+        lines += ["", f"**Run time:** {t['elapsed_s'] / 3600:.2f} h over {t['segments']} job segment(s) on {t['gpus']} GPU(s) = "
+                  f"**{t['gpu_hours']:.2f} GPU-hours**; aggregate {fmt(t['aggregate_output_tokens_per_s'], 0)} output tokens/s"
+                  + (f"; {t['interrupted_segments']} segment(s) stopped by SIGTERM (time limit) and resumed" if t.get("interrupted_segments") else "")
+                  + (f"; {t['stalled_segments']} segment(s) stopped by the stall guard" if t.get("stalled_segments") else "")
+                  + (f"; {t['unfinished_segments']} segment(s) without an end event (hard-killed job, time not counted)" if t["unfinished_segments"] else "")]
+    lines += ["", "**Data problems:** " + ("; ".join(problems) if problems else "none")]
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------- main
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="Score generations.jsonl and write a summary.")
+    ap.add_argument("generations", help="path to runs/<run>/generations.jsonl")
+    ap.add_argument("--config", default=None)
+    ap.add_argument("--out-dir", default=None, help="default: same folder as the input")
+    ap.add_argument("--overwrite", action="store_true", help="replace existing scored/summary files")
+    args = ap.parse_args(argv)
+    cfg = load_config(args.config) if args.config else load_config()
+    if cfg["scoring"]["extraction_rule"] != extract.RULE_NAME:  # config and code must agree
+        sys.exit(f"config rule {cfg['scoring']['extraction_rule']!r} != src/extract.py {extract.RULE_NAME!r}")
+    if cfg["scoring"]["lenient_rule"] != extract.LENIENT_RULE_NAME:
+        sys.exit(f"config lenient_rule {cfg['scoring']['lenient_rule']!r} != src/extract.py {extract.LENIENT_RULE_NAME!r}")
+    src = Path(args.generations)
+    out_dir = Path(args.out_dir) if args.out_dir else src.parent
+    targets = [out_dir / n for n in ("scored.jsonl", "summary.json", "summary.md")]
+    if any(t.exists() for t in targets) and not args.overwrite:
+        sys.exit(f"Outputs exist in {out_dir}; pass --overwrite to replace them.")
+
+    records, corrupt = read_jsonl(src)
+    records, superseded = latest_per_key(records)
+    scored = [score_record(r, cfg) for r in records]
+    summary = summarize(scored, corrupt, cfg, str(src), superseded, run_timing(src.parent / "run_meta.jsonl"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with targets[0].open("w", encoding="utf-8") as f:
+        for r in scored:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    targets[1].write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+    targets[2].write_text(to_markdown(summary))
+    print(to_markdown(summary))
+    print(f"Wrote {', '.join(str(t) for t in targets)}")
+
+
+if __name__ == "__main__":
+    main()
