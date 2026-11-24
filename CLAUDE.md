@@ -1,15 +1,22 @@
-# CLAUDE.md: GAR reinitialized-thinking rebuild, control experiment
+# CLAUDE.md: GAR reinitialized-thinking rebuild (control + training)
 
 ## Current goal (keep scope to this)
 
-**Produce the control-group outputs:** an untrained Qwen model answering **GPQA Diamond** in three modes, **`think`**, **`default`** and **`reinit`**, generated with **SGLang on NCSA DeltaAI**, with every input, output token and error logged. These outputs are the baseline every trained model is compared against, so they must be exactly reproducible and fully transparent.
+**1. Control outputs (the baseline):** an untrained Qwen model answering **GPQA Diamond** in three modes, **`think`**, **`default`** and **`reinit`**, generated with **SGLang on NCSA DeltaAI**, with every input, output token and error logged. These outputs are the baseline every trained model is compared against, so they must be exactly reproducible and fully transparent.
 
-**Next run (2026-11-19):** the same control experiment on **Qwen3.5-4B** (the existing code and the completed run `control_v1` use Qwen3.5-2B), with prompts that add a few worked examples so the model writes the answer exactly as asked, and a reworded `reinit` prompt so that `</analysis>` closes before the answer. The prompts are designed together with the training side (training uses the same `reinit` prompt) and frozen before any run. New prompts or a new model mean new run names (e.g. `control_4b_v1`); `control_v1` stays as it is.
+**Next control run (2026-11-19):** the same control experiment on **Qwen3.5-4B** (the existing code and the completed run `control_v1` use Qwen3.5-2B), with prompts that add a few worked examples so the model writes the answer exactly as asked, and a reworded `reinit` prompt so that `</analysis>` closes before the answer. The prompts are designed together with the training side (training uses the same `reinit` prompt) and frozen before any run. New prompts or a new model mean new run names (e.g. `control_4b_v1`); `control_v1` stays as it is.
 
-**Out of scope here:** training (it lives in the training repository). This repository holds only the control pipeline and the analysis of its outputs.
+**2. Training setup (added 2026-11-22, user's choice; branch `model-training-setup`):** get everything ready to train in the `reinit` format **as soon as the new prompts and the new control run are final**, but **do not train yet**. Training is built in this repository, starting from the slime pipeline of `Reinitialized-Thinking-Experiment-3` (vaxope/Reinitialized-Thinking-Experiment-3; local copy path in `CLAUDE.local.md`), ported one component at a time (Rule 1) and changed in three ways the user chose on 2026-11-22:
+- **DAPO instead of plain GRPO** (exact values decided later; see *Training specification*). This replaces Experiment-3's "plain GRPO only" rule.
+- **Synchronous disaggregated training instead of colocation:** rollout (SGLang) and training (Megatron) on separate GPUs (2 + 2 on one GH200 node), taking turns each step, no `--colocate`, no CPU offloading, no dependence on `torch_memory_saver` (the colocation path that caused trouble on the ARM GH200 nodes).
+- **A code-server on DeltaAI** inside a long-held Slurm allocation, so smoke tests and training attempts run inside one allocation instead of waiting in the queue for each attempt.
+
+The plan and its open questions are in the vault: `decisions/2026-11-22-training-setup-plan.md`. **Nothing of the training pipeline is written in this repo yet; each component needs the user's approval of its plan first.** Training runs only after the user says the prompts and control are final.
+
+**Out of scope:** datasets other than GPQA (evaluation only) and SuperGPQA (training); training any mode other than `reinit`.
 
 **Where things run:**
-- **DeltaAI:** all model generation (SGLang), through `scripts/deltaai/submit.sh` only.
+- **DeltaAI:** all model generation (SGLang) and all training (slime), through `scripts/deltaai/submit.sh` only (the code-server job is also submitted through it).
 - **Local machine:** writing code, unit tests, data prep, analysis of saved outputs, the trajectory viewer.
 
 ## Components
@@ -30,7 +37,7 @@ runs/<run>/generations.jsonl --[src/score.py + src/extract.py]--> scored.jsonl, 
 | `src/extract.py` | answer extraction, rule `last_answer_field_v3` (strict field or answer line), plus the lenient reading |
 | `src/data.py` | pinned, hash-verified GPQA CSV -> `data/gpqa_diamond.jsonl`; `--show N` prints prompts |
 | `src/schema.py` | field list of a generation record (the generate -> score contract) |
-| `src/generate.py` | SGLang client: sends token ids to `/generate`, logs every generation, resumable, SIGTERM-safe. (Its `--checkpoint` option serves a trained model and needs `src/check_trained.py`, which lives in the training repository; it is not used here.) |
+| `src/generate.py` | SGLang client: sends token ids to `/generate`, logs every generation, resumable, SIGTERM-safe. (Its `--checkpoint` option serves a trained model and needs `src/check_trained.py`, still to be ported from Experiment-3; see *Training components (planned)*.) |
 | `src/check_run.py` | mechanical checks of a run (prompts rebuilt, token ids, counts, completeness); PASS/FAIL |
 | `src/score.py` | scoring + all metrics (v3 accuracy, lenient accuracy, strict v2); never edits the raw log |
 | `src/compare_runs.py` | two runs side by side per mode: accuracy with clustered CI, lenient accuracy, truncation, token statistics |
@@ -40,6 +47,31 @@ runs/<run>/generations.jsonl --[src/score.py + src/extract.py]--> scored.jsonl, 
 | `scripts/deltaai/` | `setup.sh` (login node, once), `submit.sh` (the only way to submit: smoke / pilot / full), `smoke_test.sbatch`, `run_control.sbatch`, `serve_and_generate.sh`, `common.sh`, `env.example.sh` (copy to gitignored `env.sh`) |
 
 Everything uses the standard library only (Python 3.12), except the template-parity test, which needs `transformers` (and `jinja2`) in `.venv/`. Run the full suite with `.venv/bin/python tests/run_all.py`.
+
+### Training components (planned, not written yet)
+
+Source: `Reinitialized-Thinking-Experiment-3` @ `97e4706`. Each row is ported only after its plan is approved; "change" is what differs from Experiment-3.
+
+```
+SuperGPQA (pinned) --[src/train_data.py]--> data/train/<build>/{train,val}.jsonl --[src/train_prep.py]--> slime input (reinit prompt)
+configs/train_reinit.toml --[src/train_args.py]--> slime flags (DAPO, disaggregated GPUs)
+slime train.py on DeltaAI: SGLang rollout GPU(s) <-> Megatron training GPU(s); src/reward.py, src/slime_hooks.py
+     --> checkpoints --[convert + src/check_trained.py]--> HF model --[src/generate.py --checkpoint, control.toml unchanged]--> scored like control
+```
+
+| File | Role | Change from Experiment-3 |
+|---|---|---|
+| `configs/train_data.toml` + `src/train_data.py` | SuperGPQA physics/chemistry/biology -> dedup -> GPQA decontamination -> 4 options -> train/val | none planned |
+| `configs/train_reinit.toml` + `src/train_args.py` | parameter sheet -> slime flags; refuses sampling/reward differing from control | DAPO flags instead of the plain-GRPO guard; no `--colocate`; 2 actor + 2 rollout GPUs; Qwen3.5-4B architecture |
+| `src/train_prep.py` | questions -> slime input lines with the exact `build_text` reinit prompt, parity-checked | uses the new frozen reinit prompt |
+| `src/reward.py` | reward = rule v3 (1/0), every rollout logged | optional DAPO overlong shaping (slime has no built-in flag for it) |
+| `src/slime_hooks.py` | adds min_p / presence / repetition penalty to slime's sampling; plain-text prompts | none planned (the standard rollout function is kept) |
+| `configs/slime_container.toml` + `src/slime_container.py` + `containers/slime_gh200.def` | arm64/GH200 slime image (image `3aff7962…` built in Experiment-3, job 3620006) | `torch_memory_saver` no longer needed for training (kept or dropped: decide in its plan) |
+| `src/check_roundtrip.py`, `src/check_smoke.py` | HF <-> Megatron weight check; smoke-run checks | smoke run uses the disaggregated layout |
+| `src/pick_checkpoint.py`, `src/check_trained.py`, `scripts/deltaai/eval_trained.sbatch` | pick a checkpoint on SuperGPQA validation (never GPQA), convert, check, evaluate like control | little: synchronous disaggregated keeps slime's in-loop validation; checks updated for 4B |
+| `src/train_report.py` | per-step training summary from the rollout log | add DAPO metrics (groups dropped by dynamic sampling, clip fractions) |
+| `scripts/deltaai/` (training) | `build_slime.sbatch`, `slime_setup.sbatch`, `train_reinit.sbatch`, `train_inside.sh`, `slime_common.sh`, `smoke_train.sh` | multi-GPU request; private Ray on loopback kept |
+| `scripts/deltaai/code_server.sbatch` (new) | starts a pinned code-server on a compute node inside a long allocation; reached through an SSH tunnel | new component |
 
 ---
 
@@ -68,7 +100,7 @@ Everything uses the standard library only (Python 3.12), except the template-par
 ## Rule 3: Consult before acting
 
 **Always stop and ask before:**
-- any DeltaAI job (`sbatch`, `salloc`, `srun`). State the GPUs, the time requested and the estimated GPU-hours;
+- any DeltaAI job (`sbatch`, `salloc`, `srun`), including starting a code-server session and launching training or smoke runs inside one. State the GPUs, the time requested and the estimated GPU-hours (a held allocation is charged while idle);
 - installing packages, pulling or building containers, or changing the environment;
 - deleting or overwriting data, outputs or logs;
 - changing prompts, chat-template handling, sampling settings, answer extraction or metrics once a run has started. These break comparability; a change means a new run name.
@@ -114,6 +146,21 @@ Options are shuffled with seed string `<shuffle_salt>|<qid>|<sample_idx>`, share
 - Answer extraction: `src/extract.extract_answer`, rule `last_answer_field_v3` (**user's choice 2026-11-16**, after pilot_v1 showed only 5/60 strict fields): the last answer field in the visible text (after the first `</think>` in think mode, after the first `</analysis>` in reinit mode; a block that never closes = no answer). A field is the strict `"answer": "X"` or an answer line (`answer` key in any case/quoting, `:`, one capital letter, nothing else on the line; e.g. `answer: C`, `answer": "C"`). Prose ("the answer is C"), bare letters and other keys are not accepted (counted as near misses). Strict-v2 accuracy is reported beside it. **Lenient reading beside v3** (user's choice 2026-11-16, after control_v1): `extract_lenient`, rule `any_answer_lenient_v1` (`[scoring] lenient_rule`): "if it gives an answer, count it": the last answer of any shape anywhere in the output (fields, `<answer>X</answer>`, choice lines, "the answer is X" unless hypothetical, a bare final letter, a final option line); truncated still wrong. Reported as `lenient_answer`/`lenient_correct` and "accuracy, lenient"; never the official accuracy and never the reward.
 - Scoring: a truncated generation (`finish_reason` `length`) counts as wrong; accuracy uses all records as the denominator; 95% CI is Wilson (1 sample/question) or clustered by question (>1).
 
+## Training specification (planned; values will live in `configs/train_reinit.toml`)
+
+Decided by the user on 2026-11-22. Everything marked *open* is decided later, before the first training job; once a run starts, any change means a new run name.
+
+- **Kept from Experiment-3 (unless the user changes them):** training data SuperGPQA (`m-a-p/SuperGPQA`, Science / Physics, Chemistry, Biology, 4 options, decontaminated against GPQA); prompt = the `reinit` prompt exactly as `src/prompts.py` builds it; reward from `extract.py` rule v3 (1 correct, 0 otherwise; truncated or `<analysis>` never closed = 0); rollout sampling identical to the control sampling; GPQA never used for training or checkpoint choice; every trained model is evaluated exactly like the control (198 × 4 × three modes, control sampling, 81,920 cap, v3 + lenient).
+- **Algorithm: DAPO** (Yu et al. 2025) instead of plain GRPO. Its four parts and how slime @ `79aa41a` provides them (read from slime's `arguments.py` on 2026-11-22):
+  - clip-higher: `--eps-clip` (low) and `--eps-clip-high` (high); paper values 0.2 / 0.28;
+  - dynamic sampling: `--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` with `--over-sampling-batch-size` (drops groups whose answers are all right or all wrong);
+  - token-level loss: `--calculate-per-token-loss`;
+  - overlong reward shaping: **no slime flag**; would be added in `src/reward.py` (soft length penalty in a buffer before the limit) or replaced by overlong filtering (truncated answers masked from the loss);
+  - KL: DAPO drops the KL term (`--use-kl-loss` off). *Open:* all values, and whether each part is used.
+- **Layout (user, 2026-11-22): synchronous disaggregated** on one full GH200 node: **2 rollout GPUs (SGLang) + 2 training GPUs (Megatron)**, no `--colocate`, no offload, standard rollout function (`--actor-num-gpus-per-node 2`, `--rollout-num-gpus 2`). Fully on-policy; slime's in-loop validation (`--eval-interval`) keeps working, so checkpoints are still chosen on SuperGPQA validation. Fully async (`slime.rollout.fully_async_rollout`) was rejected: answers up to a step stale and no evaluation mode at `79aa41a`. Cost: about 4 GPU-hours per wall-clock hour.
+- **Model (user, 2026-11-22): `Qwen/Qwen3.5-4B`**, to match the next control run (`control_4b_v1`); revision pinned when that control run pins it. Architecture flags from slime's `scripts/models/qwen3.5-4B.sh`, checked against the model's `config.json` by `train_args.py`.
+- **Code-server (user, 2026-11-22):** first check whether DeltaAI's Open OnDemand offers a code-server / VS Code app (no install). If not: a pinned arm64 code-server release started by `scripts/deltaai/code_server.sbatch` (through `submit.sh`) on a `ghx4` compute node, password from a gitignored file, bound to the node's loopback and reached through an SSH tunnel via the login node. It saves queue waits *between attempts*, not the first wait; GPUs held by it are charged while idle. *Open:* GPUs and hours per session.
+
 ## Milestones and verification gates
 
 1. **Data:** load GPQA Diamond and print 5 formatted prompts per mode exactly as sent (`python3 -m src.data --show 5`). All gold letters check out. **Done 2026-11-13** (198 questions).
@@ -123,6 +170,14 @@ Options are shuffled with seed string `<shuffle_salt>|<qid>|<sample_idx>`, share
 5. **Pilot:** 20 questions × 3 modes × 1 sample (60 generations). The user reads several full outputs per mode: right prefix, sensible length, an `"answer": "X"` field at the end. Measure tokens per second and project the full run's GPU-hours.
 6. **Full control run**, then a summary table (accuracy with confidence intervals, token counts, truncation rate, extraction failures) and a run note. **Done 2026-11-16:** `control_v1`, job 3611928, 0.94 SU, 2,376/2,376, 0 errors, check_run PASS. v3 accuracy think 0.563 · default 0.364 · reinit 0.313; lenient 0.564 · 0.374 · 0.485.
 
+**Training gates (planned, each needs the user's approval):**
+
+7. **Plan approved:** model, DAPO parts, async flavour and GPU split, code-server approach (vault `decisions/2026-11-22-training-setup-plan.md`). **Partly done 2026-11-22:** Qwen3.5-4B, synchronous disaggregated 2 + 2 GPUs, code-server via OnDemand check then own job. Still open: DAPO values; code-server GPUs/hours.
+8. **Components ported and tested locally:** every training component above, with unit tests passing and no slime or GPU needed (`.venv/bin/python tests/run_all.py`).
+9. **Code-server job:** starts on a compute node, reachable through the tunnel, `nvidia-smi` shows the requested GPUs; stops cleanly at the time limit.
+10. **Smoke training (disaggregated):** 2 DAPO steps, step 2 generated with the weights after update 1 (proves the trainer -> SGLang weight push across GPUs), checkpoint saved and converted.
+11. **Prompts + control final:** the new frozen `reinit` prompt in `src/prompts.py`, the matching control run done. Only then the real training run.
+
 ## Logging (one JSONL record per generation)
 
 `run_id, mode, model, model_revision, qid, sample_idx, seed, option_order, chat_template_hash, input_text, input_token_ids, output_text, output_token_ids, output_logprobs, finish_reason, n_input_tokens, n_output_tokens, n_think_tokens, extracted_answer, extraction_rule, gold, correct, sampling_params, sglang_version, wall_time_s, error`
@@ -131,6 +186,8 @@ Extra generation fields include `n_analysis_tokens` and `analysis_closed` (reini
 
 ## Notes
 
-Write a short note for every run (job id, cost, result) and every decision (what, why, who decided, date), and share it with the training side. Never put personal paths, emails or GPQA question text in notes or commits.
+Write a short note for every run (job id, cost, result), every decision (what, why, who decided, date) and every change. Never put personal paths, emails or GPQA question text in notes or commits.
 
-**References:** GAR official code `RickySkywalker/GAR-Official` @ `aa04bed`.
+**Where notes go:** the Obsidian vault **Research**, folder **`Reinitialized Thinking Experiment/`** (the vault's absolute path is in the gitignored `CLAUDE.local.md`, because it contains personal details). Never edit outside that folder or touch `.obsidian/`. Folders: `decisions/`, `changes/`, `components/`, `runs/`, plus `index.md` (link every new note from it). Frontmatter: `type, date, status, where (local|deltaai), job, git, related, tags`. Body: Summary · What · How it connects · Why · Results (real numbers only) · Risks & undo (`> [!warning]`) · Next steps. Notes from earlier work stay in `Past Experiments/GAR-Rebuild/` and are linked, not copied.
+
+**References:** GAR official code `RickySkywalker/GAR-Official` @ `aa04bed`; training base `vaxope/Reinitialized-Thinking-Experiment-3` @ `97e4706`; slime `THUDM/slime` @ `79aa41a`; DAPO paper note in the vault at `Research Papers/Notes/DAPO.md`.

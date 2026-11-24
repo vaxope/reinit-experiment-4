@@ -6,8 +6,9 @@ runs/
 *.parquet
 *.arrow
 
-# Local-only notes and per-user Claude settings
+# Local-only notes and per-user Claude settings (CLAUDE.local.md holds personal paths)
 INFRASTRUCTURE.md
+CLAUDE.local.md
 .claude/
 
 # Python environment and caches
