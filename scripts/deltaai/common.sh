@@ -4,7 +4,9 @@
 #   run <cmd...>   run a command inside the SGLang Apptainer container (or directly, for local tests)
 #   PYTHON         the python inside the container ("python3")
 #   load_cfg       sets MODEL, REVISION, DTYPE, HOST, PORT, SEED, ATTN_BACKEND, MM_ATTN_BACKEND, WAIT_S, and the [container] pins
-#                  IMAGE, IMAGE_DIGEST, SGLANG_PIN, SIF_SHA256 from configs/control.toml
+#                  IMAGE, IMAGE_DIGEST, SGLANG_PIN, SIF_SHA256 from the control config:
+#                  $CONTROL_CONFIG if set (the training smoke run sets it to the config of the
+#                  control its model is compared with), else configs/control.toml (unchanged default)
 #   env_report     prints node, GPU, container and package versions into the job log
 #
 # Local testing (no Apptainer/GPU): set CONTAINER_EXEC="" so commands run directly, and point
@@ -58,8 +60,8 @@ port_free() {
 load_cfg() {
   # One python call reads every value the shell needs from the config (single source of truth).
   eval "$(run "$PYTHON" -c '
-import shlex, tomllib
-c = tomllib.load(open("configs/control.toml", "rb"))
+import shlex, sys, tomllib
+c = tomllib.load(open(sys.argv[1], "rb"))
 for k, v in {"MODEL": c["model"]["name"], "REVISION": c["model"]["revision"],
              "DTYPE": c["model"]["dtype"], "HOST": c["server"]["host"],
              "PORT": c["server"]["port"], "SEED": c["server"]["random_seed"],
@@ -69,7 +71,7 @@ for k, v in {"MODEL": c["model"]["name"], "REVISION": c["model"]["revision"],
              "IMAGE": c["container"]["image"], "IMAGE_DIGEST": c["container"]["image_digest_arm64"],
              "SGLANG_PIN": c["container"]["sglang_version"], "SIF_SHA256": c["container"]["sif_sha256"]}.items():
     print(f"{k}={shlex.quote(str(v))}")
-')"
+' "${CONTROL_CONFIG:-configs/control.toml}")"
 }
 
 env_report() {

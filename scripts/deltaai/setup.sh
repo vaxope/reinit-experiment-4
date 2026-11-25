@@ -10,7 +10,8 @@
 #      image must equal sglang_version; the .sif's SHA-256 is computed (about a minute for
 #      14 GB) and compared with sif_sha256 (if recorded; otherwise printed so you can record it)
 #   3. download the model + tokenizer at the PINNED revision into $HF_HOME (about 5 GB), so jobs
-#      can run with HF_HUB_OFFLINE=1 and never fetch anything mid-run
+#      can run with HF_HUB_OFFLINE=1 and never fetch anything mid-run; also the training model of
+#      configs/train_reinit.toml (Qwen3.5-4B, about 9 GB)
 #   4. data/gpqa_diamond.jsonl present with 198 questions (copy it from your Mac with
 #      scp/rsync: data/ is gitignored and GPQA must not go through GitHub)
 #   5. the unit tests, inside the container, on the CPU (includes template parity and the
@@ -58,13 +59,22 @@ if [ "${#CONTAINER[@]}" -gt 0 ]; then
 fi
 
 echo "== 3. model + tokenizer at the pinned revision -> $HF_HOME"
+# The control's model ($CONTROL_CONFIG if set, else configs/control.toml, as common.sh), and the
+# training model (configs/train_reinit.toml [model], Qwen3.5-4B): the training jobs run offline and
+# stop at once if it is not in the cache (slime_common.sh slime_paths). 2026-11-24.
 HF_HUB_OFFLINE=0 run "$PYTHON" -c '
-import tomllib
+import os, sys, tomllib
 from huggingface_hub import snapshot_download
-c = tomllib.load(open("configs/control.toml", "rb"))["model"]
-p = snapshot_download(c["name"], revision=c["revision"])
-print("  downloaded", c["name"], "@", c["revision"], "->", p)
-'
+models = []
+c = tomllib.load(open(sys.argv[1], "rb"))["model"]
+models.append((c["name"], c["revision"]))
+if os.path.exists("configs/train_reinit.toml"):
+    t = tomllib.load(open("configs/train_reinit.toml", "rb"))["model"]
+    models.append((t["hf_repo"], t["revision"]))
+for name, rev in dict.fromkeys(models):
+    p = snapshot_download(name, revision=rev)
+    print("  downloaded", name, "@", rev, "->", p)
+' "${CONTROL_CONFIG:-configs/control.toml}"
 
 echo "== 4. data"
 if [ ! -f data/gpqa_diamond.jsonl ]; then

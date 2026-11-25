@@ -80,7 +80,9 @@ kill -0 "$SERVER_PID" 2>/dev/null || { echo "[serve] ERROR: health answered but 
 echo "[serve] server (pid $SERVER_PID) healthy after $((SECONDS - t_wait))s"
 
 set +e
-run "$PYTHON" -m src.generate --server-url "http://$HOST:$PORT" "$@"
+# CONTROL_CONFIG (optional, see common.sh): the same control config reaches generate.py; unset ->
+# generate.py uses its default configs/control.toml, exactly as before.
+run "$PYTHON" -m src.generate --server-url "http://$HOST:$PORT" ${CONTROL_CONFIG:+--config "$CONTROL_CONFIG"} "$@"
 status=$?
 set -e
 echo "[serve] generate.py exited with status $status"

@@ -21,6 +21,13 @@ export REPO_DIR="/projects/<your-project>/<you>/Reinitialized-Thinking-Control"
 # (inside tmux: it takes hours). setup.sh checks the SGLang version inside it.
 export SGLANG_SIF="/projects/<your-project>/<you>/containers/sglang-v0.5.23-runtime.sif"
 
+# Folder for the slime training image built by `submit.sh build-slime` (about 20 GB). The file
+# name and every version inside it come from configs/slime_container.toml.
+export SLIME_SIF_DIR="/projects/<your-project>/<you>/containers"
+# Megatron checkpoints: the converted start model (~5 GB) and each training run's checkpoints
+# (~30 GB per saved step with optimizer state). Project storage, not $HOME.
+export SLIME_CKPT_DIR="/projects/<your-project>/<you>/slime_checkpoints"
+
 # Apptainer's download cache and its unpacking scratch space. Both default to places that
 # are small on a login node ($HOME/.apptainer and /tmp); a 14 GB image needs project storage.
 export APPTAINER_CACHEDIR="/projects/<your-project>/<you>/apptainer_cache"
@@ -35,3 +42,14 @@ export HF_HOME="/projects/<your-project>/<you>/hf_cache"
 export SMOKE_TIME="00:20:00"
 export PILOT_TIME="01:30:00"
 export FULL_TIME="06:00:00"
+# The slime image build. Job 3616837 (failed at step 7) took 1 h 38 min to get there; the
+# rest (steps 7-12, writing the ~20-30 GB image, hash, GPU check) adds roughly 30-50 min, so
+# 2.5 h is too tight: a time-out while the image file is written loses the whole build.
+export BUILD_SLIME_TIME="03:30:00"
+# One-time setup + smoke test (submit.sh slime-setup, 4 GPUs): 4B conversion + round trip, GPU and
+# flag checks, then the 2-step DAPO smoke run with a forced 32,768-token answer per group in step 1,
+# two 16-question validations, a ~60 GB save, conversion and the serving test. Unmeasured; 2.5 h was
+# Experiment-3's 2B/1-GPU value. 3 h x 4 GPUs = at most 12 GPU-hours (only time used is charged);
+# a time-out would cost another queue wait. A rerun after the setup step passed skips conversion.
+export SLIME_SETUP_TIME="03:00:00"
+# (Times for the long training run and the trained-model evaluation are added when those jobs are ported.)

@@ -1,0 +1,330 @@
+# configs/train_reinit.toml: every parameter of the DAPO training run in the reinit format.
+#
+# Purpose : single source of truth for training Qwen3.5-4B with slime on SuperGPQA
+#           physics/chemistry/biology questions posed in the `reinit` format. No script
+#           hard-codes these values: src/train_args.py turns this file into slime's
+#           command-line flags, src/train_prep.py reads [data], src/slime_hooks.py reads
+#           [sampling], src/reward.py reads [reward] and [overlong].
+# Based on: Reinitialized-Thinking-Experiment-3 @ 97e4706, configs/train_reinit.toml (plain GRPO,
+#           Qwen3.5-2B, 1 GPU colocated). Changed by the user on 2026-11-22/24:
+#             - model Qwen3.5-4B (to match the next control run)         -> [model], [megatron_model]
+#             - DAPO instead of plain GRPO; values NOT decided yet        -> [algorithm], [overlong]
+#             - rollout and training on separate GPUs (2 + 2, one GH200
+#               node, synchronous, no --colocate, no offload)             -> [hardware]
+#           Everything else keeps Experiment-3's confirmed values (user, 2026-11-24: "the same
+#           parameters from the previous experiment for everything else").
+#           Values marked PLACEHOLDER are not decided: they are there so the smoke test runs every
+#           code path, and are replaced (with a new run name) once the parameter sheet is final.
+# Pipeline: data/train/supergpqa_pcb_v1/{train,val}.jsonl --[src/train_prep.py]--> slime input
+#           files --[slime train.py with src/train_args.py flags, inside the slime container on
+#           DeltaAI]--> checkpoints --> converted to HF --> evaluated exactly like the control.
+# Rule    : once a run has started, changing any value means a new run name ([run] name).
+#
+# Each value: meaning | value | source | reason.
+
+[run]
+# Name of the run: output folder runs/<name>/ and the checkpoint folder name. PLACEHOLDER name
+# until the DAPO values and the prompt are final.
+name = "train_reinit_4b_dapo_v1"
+# Megatron's global seed | 1234 | slime default (`--seed`), as Experiment-3.
+seed = 1234
+# Steps to run (`--num-rollout`): one step = one batch of rollouts + one optimizer update.
+# 100 | Experiment-3 (user, 2026-11-17). The smoke test uses [smoke] steps instead.
+num_steps = 100
+# The control run this training is compared with: its config must have the same model, revision,
+# chat template, sampling, answer rule and SGLang kernels (src/train_args.check_against_control).
+# configs/control_4b.toml does NOT exist yet: it is written when the 4B control run pins its model
+# revision and prompts. Until then src/train_args.py refuses to build flags (by design).
+control_config = "configs/control_4b.toml"
+
+[model]
+# Starting model | user, 2026-11-22 | the same weights as the 4B control run.
+hf_repo = "Qwen/Qwen3.5-4B"
+# Hugging Face commit | 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a = `main` on 2026-11-24 (last
+# modified 2026-03-02) | PLACEHOLDER until the 4B control pins its revision; must equal it.
+revision = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+# SHA-256 of chat_template.jinja at that revision (computed 2026-11-24). Differs from the 2B's
+# (273d8e0e...): the 4B template turns thinking ON when enable_thinking is not given, the 2B's OFF.
+# src/prompts.py always passes enable_thinking explicitly, so the prompt text is the same.
+chat_template_sha256 = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+
+[megatron_model]
+# Architecture of Qwen3.5-4B for Megatron, exactly slime's scripts/models/qwen3.5-4B.sh @ 79aa41a.
+# Numbers checked against the model's config.json @ 851bf6e8 (text_config) on 2026-11-24;
+# src/train_args.py compares every value with config.json at run time and refuses any mismatch.
+spec = ["slime_plugins.models.qwen3_5", "get_qwen3_5_spec"]   # slime's Qwen3.5 layer plugin
+num_layers = 32              # num_hidden_layers
+hidden_size = 2560           # hidden_size
+ffn_hidden_size = 9216       # intermediate_size
+num_attention_heads = 16     # num_attention_heads
+num_query_groups = 4         # num_key_value_heads (grouped-query attention)
+kv_channels = 256            # head_dim
+vocab_size = 248320          # vocab_size
+rotary_base = 10000000       # rope_theta
+rotary_percent = 0.25        # partial_rotary_factor (rope on a quarter of each head)
+norm_epsilon = 1e-6          # rms_norm_eps
+# Flags with no value, as in slime's qwen3.5-4B.sh: no biases, per-head q/k norm, GQA, gated
+# attention + output gate, RMSNorm with the (1+w) form, SwiGLU.
+flags = ["--disable-bias-linear", "--qk-layernorm", "--group-query-attention",
+         "--use-gated-attention", "--attention-output-gate", "--apply-layernorm-1p",
+         "--swiglu"]
+normalization = "RMSNorm"
+position_embedding_type = "rope"
+# Longest position the model supports | 262,144 | config.json max_position_embeddings | set
+# explicitly because slime otherwise fills in 4,096 (Experiment-3).
+max_position_embeddings = 262144
+# Dropout off | 0.0 | slime run scripts, as Experiment-3.
+attention_dropout = 0.0
+hidden_dropout = 0.0
+
+[numerics]
+# Unchanged from Experiment-3 (slime run-qwen3-4B.sh; gradient-accumulation fusion off because the
+# arm64 image has no APEX, setup job 3622008).
+accumulate_allreduce_grads_in_fp32 = true
+attention_softmax_in_fp32 = true
+gradient_accumulation_fusion = false
+
+[data]
+# The training-data build this run uses (configs/train_data.toml [output] dir) | Experiment-3.
+source_dir = "data/train/supergpqa_pcb_v1"
+# Which prompt the questions are posed in | "reinit" | the experiment. The prompt TEXT lives in
+# src/prompts.py; when the new frozen reinit prompt replaces it there, train_prep picks it up
+# (and records its hash), with no change here except a new output_dir / run name.
+prompt_mode = "reinit"
+# Option shuffle for training questions | Experiment-3.
+shuffle_salt = "supergpqa-train-v1"
+# Where src/train_prep.py writes slime's input files (gitignored data/). A new folder for the 4B
+# (different chat template, so the parity check is redone).
+output_dir = "data/train/supergpqa_pcb_v1/slime_reinit_4b"
+# Keys inside those files (--input-key / --label-key / --metadata-key).
+input_key = "text"
+label_key = "label"
+metadata_key = "metadata"
+
+[reward]
+# Answer rule | the control run's official rule | src/train_args.py refuses anything else.
+rule = "last_answer_field_v3"
+# Correctness reward | 1 / 0 | Experiment-3 (user, 2026-11-15). DAPO's paper uses +1 / -1; that
+# is a DAPO value still to decide (PLACEHOLDER kept at the previous experiment's 1 / 0).
+correct = 1.0
+incorrect = 0.0
+
+[overlong]
+# DAPO's overlong reward shaping ("soft overlong punishment"), added in src/reward.py because
+# slime @ 79aa41a has no flag for it. With L = [rollout] max_response_len, B = buffer_len:
+#   length <= L - B        -> 0
+#   L - B < length <= L    -> penalty_factor * ((L - B) - length) / B   (0 down to -penalty_factor)
+# added to the correctness reward. A truncated answer (length = L) gets incorrect - penalty_factor.
+# mode | "soft_punish" or "none" | PLACEHOLDER (DAPO paper uses it) | decide with the parameter sheet.
+mode = "soft_punish"
+# buffer_len | 4,096 tokens | PLACEHOLDER (DAPO paper: 4,096 on a 20,480 limit).
+buffer_len = 4096
+# penalty_factor | 1.0 | PLACEHOLDER (DAPO paper).
+penalty_factor = 1.0
+
+[sampling]
+# Rollout sampling = the control run's sampling, exactly. src/train_args.py refuses any difference
+# from the control config. temperature / top_p / top_k go to slime's flags; min_p and the
+# penalties are added by src/slime_hooks.py.
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+
+[rollout]
+# Unchanged from Experiment-3 (user, 2026-11-17).
+# Answers per question (the group) | 8.
+n_samples_per_prompt = 8
+# Questions per step | 16. With dynamic sampling, the 16 groups KEPT (some answers right, some wrong).
+rollout_batch_size = 16
+# Answers per optimizer update | 16 x 8 = 128 | one update per step (checked).
+global_batch_size = 128
+# Longest answer | 32,768 tokens | user, 2026-11-17.
+max_response_len = 32768
+# Longest prompt | 2,048 tokens | src/train_prep.py refuses longer prompts. Few-shot examples in
+# the new prompts will make prompts longer: train_prep reports the longest; raise this if needed.
+max_prompt_len = 2048
+# Shuffle question order each epoch, with this seed | slime default 42.
+shuffle = true
+shuffle_seed = 42
+
+[algorithm]
+# DAPO (Yu et al. 2025) | user, 2026-11-22. Every value below is a PLACEHOLDER (DAPO paper value
+# or slime's example) until the parameter sheet is final; each one maps to one slime flag
+# (slime @ 79aa41a, slime/utils/arguments.py, read 2026-11-22).
+name = "dapo"
+# Group-normalised advantage, as in GRPO and DAPO | slime `--advantage-estimator grpo`.
+advantage_estimator = "grpo"
+# Divide by the group std (DAPO keeps it) | slime's default (off = --disable-grpo-std-normalization).
+std_normalization = true
+# Clip-higher: lower and upper PPO clip | 0.2 / 0.28 | PLACEHOLDER (paper) | --eps-clip / --eps-clip-high.
+eps_clip = 0.2
+eps_clip_high = 0.28
+# Token-level loss: average over all tokens in the batch | on | PLACEHOLDER (paper) |
+# --calculate-per-token-loss.
+per_token_loss = true
+# Dynamic sampling: drop groups whose answers are all right or all wrong (DAPO: "accuracy equal to
+# 1 or 0") | on | PLACEHOLDER (paper) | --dynamic-sampling-filter-path <filter>.
+# Filter = OURS, on CORRECTNESS (user, 2026-11-24): src/dapo_filters.check_correctness_varies.
+# slime's check_reward_nonzero_std looks at the reward, which includes the [overlong] penalty, so
+# an all-wrong group with some long answers would be kept with a length-only signal (review
+# 2026-11-24); src/train_args.py refuses that filter while overlong shaping is on.
+# slime keeps sampling rounds until rollout_batch_size groups are kept, with no round limit
+# (slime/rollout/sglang_rollout.py:529). `..._with_fallback` keeps rejected groups instead of
+# starting another round when candidates run short (fewer rounds, but some no-signal groups).
+dynamic_sampling = true
+dynamic_sampling_filter = "src.dapo_filters.check_correctness_varies"
+# Questions sampled per round while filling the batch | 32 (2 x rollout_batch_size) | PLACEHOLDER |
+# --over-sampling-batch-size; must be >= rollout_batch_size.
+over_sampling_batch_size = 32
+# KL penalty | off | PLACEHOLDER (DAPO drops it; Experiment-3 had k3 0.001) | --use-kl-loss.
+use_kl_loss = false
+kl_loss_type = "k3"
+kl_loss_coef = 0.0
+# Not part of DAPO; listed so the checks keep them off.
+entropy_coef = 0.0
+use_tis = false
+
+[optimizer]
+# Unchanged from Experiment-3: AdamW at Megatron's defaults, constant lr 1e-6, no warmup (user,
+# 2026-11-17). (The DAPO paper warms up for 20 steps; decide with the parameter sheet.)
+optimizer = "adam"
+lr = 1e-6
+lr_decay_style = "constant"
+lr_warmup_iters = 0
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+adam_eps = 1e-8
+weight_decay = 0.01
+clip_grad = 1.0
+
+[eval]
+# Validation on the held-out SuperGPQA slice (300 questions; GPQA is never used here) | Experiment-3.
+# Works in-loop because training is synchronous ([hardware] rollout_mode).
+# Every 25 steps (was 10 in Experiment-3) | user, 2026-11-24 (disk fix) | must equal
+# [checkpoint] save_interval (src/pick_checkpoint.py): validation passes at steps 0/25/50/75/100.
+interval = 25
+n_samples_per_prompt = 1
+max_response_len = 32768
+name = "supergpqa_val"
+
+[checkpoint]
+# Save every 25 steps (was 10) | user, 2026-11-24 | the quota: /projects/bgss holds 500 GB in
+# total, a 4B save with optimizer state is ~56-60 GB, so 10 saves (~600 GB) cannot fit; 100 steps
+# / 25 = 4 saves (~240 GB). Must equal [eval] interval.
+save_interval = 25
+# Size of one save, GB | 60 | ESTIMATE (4.2B params x (2 bf16 weights + 4 fp32 master + 8 fp32
+# Adam) = 59 GB) | the smoke run prints the measured size of its step-2 save next to this value.
+est_save_gb = 60
+# Most the run's saves may use, GB | 400 | 500 GB quota minus the Megatron start copy (~9 GB),
+# the smoke run's temporary save and everything else on the project | src/train_args.py refuses
+# a config whose saves (one per save_interval, plus the last step) x est_save_gb exceed it.
+disk_budget_gb = 400
+
+[hardware]
+# One GH200 node (4 GPUs, 96 GB each): training and generation on SEPARATE GPUs | user, 2026-11-22.
+# rollout_mode | "sync" | user, 2026-11-22: slime's standard rollout (generation, then training,
+# then the weight push, each step), fully on-policy, in-loop validation works. "fully_async"
+# (slime.rollout.fully_async_rollout) is refused by src/train_args.py for now: no evaluation mode
+# at 79aa41a, so checkpoints could not be chosen on validation.
+rollout_mode = "sync"
+# GPUs for Megatron training (--actor-num-gpus-per-node) | 2 | user, 2026-11-22.
+actor_num_gpus = 2
+# GPUs for SGLang generation (--rollout-num-gpus) | 2 | user, 2026-11-22.
+rollout_num_gpus = 2
+# GPUs per SGLang engine | 1 -> 2 engines (data parallel) | Experiment-3's value.
+rollout_num_gpus_per_engine = 1
+# GPUs on the node (--num-gpus-per-node; the Slurm request) | 4 | DeltaAI GH200 node. Must equal
+# actor_num_gpus + rollout_num_gpus (checked; the .sbatch headers are checked against it in tests).
+gpus_per_node = 4
+# Megatron parallelism on the 2 training GPUs | tensor parallel 2 (user, 2026-11-24): each layer is
+# split across both GPUs, including the output layer, so each GPU holds HALF of the 248,320-token
+# vocabulary's logits. With tensor parallel 1 the fp32 logits of one 36,864-token micro-batch
+# (slime converts them to fp32, model_provider.py:99) take 34.6 GB + 34.6 GB gradient on ONE GPU:
+# out of memory on every step (review 2026-11-24). Data parallel = 2 / 2 = 1.
+# Qwen3.5's linear-attention layers are not split; slime runs them whole on both GPUs
+# (slime_plugins/models/hf_attention.py), so they count fully per GPU in the memory estimate below.
+tensor_model_parallel_size = 2
+pipeline_model_parallel_size = 1
+context_parallel_size = 1
+# Sequence parallel: splits the per-token activations outside attention across the 2 tensor-
+# parallel GPUs | on | slime's Qwen3.5 run scripts use it with tensor parallel (run-qwen3.5-27B.sh,
+# run-qwen3.5-35B-A3B-sft.sh @ 79aa41a); hf_attention.py handles it explicitly; slime pads packed
+# batches to a multiple of the tensor-parallel size (megatron_utils/data.py).
+sequence_parallel = true
+# Megatron's distributed optimizer | on | required by the precision-aware optimizer below
+# (Megatron ae76c60e core/optimizer/__init__.py: "--use-precision-aware-optimizer only supported
+# with distributed optimizer"). With data parallel 1 it shards nothing.
+use_distributed_optimizer = true
+# Optimizer on the CPU: fp32 master weights and both Adam moments in CPU memory, Adam step on the
+# CPU (PyTorch AdamW, decoupled weight decay = the same AdamW) | on | slime's Qwen3.5 run scripts
+# (as above) | frees ~31 GB per training GPU (2.6B params x 12 bytes), see the estimate below.
+# Megatron asserts it is paired with --use-precision-aware-optimizer (training/arguments.py).
+# Costs some seconds per step for the CPU Adam step; generation dominates step time.
+optimizer_cpu_offload = true
+use_precision_aware_optimizer = true
+# Share of the optimizer on the CPU | 1.0 = all | set explicitly: the command-line default is 1.0
+# but Megatron's OptimizerConfig default is 0.0.
+optimizer_offload_fraction = 1.0
+# Precision of master weights, gradients and both Adam moments | fp32 all | Megatron's defaults,
+# written out so the precision-aware optimizer can never lower them (checked).
+main_params_dtype = "fp32"
+main_grads_dtype = "fp32"
+exp_avg_dtype = "fp32"
+exp_avg_sq_dtype = "fp32"
+# Weight push from Megatron to SGLang | "nccl" (slime default: broadcast over GPU links) |
+# fallback "disk" (writes an HF checkpoint the engines reload; needs --update-weight-disk-dir,
+# which smoke_train.sh supplies) if NCCL between the trainer and SGLang fails on the node.
+update_weight_transport = "nccl"
+# Share of GPU memory SGLang may take on ITS OWN GPUs | 0.7 | Experiment-3 | kept low on purpose:
+# 0.7 x 96 GB leaves ~58 GB of KV cache after the 4B weights, enough; raise only after the smoke run.
+sglang_mem_fraction_static = 0.7
+# SGLang attention kernels | flashinfer / triton_attn | MUST equal the control config's [server]
+# (no FA3 in the arm64 image; smoke jobs 3611059 and 3633318).
+sglang_attention_backend = "flashinfer"
+sglang_mm_attention_backend = "triton_attn"
+# Tokens per micro-batch per training GPU | 36,864 (one 2,048 + 32,768 sequence) | Experiment-3 |
+# must be >= max_prompt_len + max_response_len (checked): a longer sequence would sit alone in
+# its own bigger micro-batch (slime dp_schedule), outside the memory estimate.
+max_tokens_per_gpu = 36864
+log_probs_chunk_size = 1024
+recompute_granularity = "full"
+recompute_method = "uniform"
+recompute_num_layers = 1
+
+# Memory estimate per training GPU (src/train_args.memory_estimate_gb; the job is refused when it
+# exceeds gpu_memory_gb x usable_fraction). An ESTIMATE, written so that a config that cannot fit
+# (e.g. tensor parallel 1) is caught locally instead of after a queue wait:
+#   params per GPU = (params_total - params_replicated) / TP + params_replicated
+#   model state    = params per GPU x (2 bf16 weights + 4 fp32 grads [+ 12 master/Adam unless offloaded])
+#   logits         = tokens x vocab / TP x 10 bytes (fp32 logits + fp32 grad + bf16 grad)
+#   + activation_reserve_gb (full recompute; ASSUMPTION, not measured)
+# GPU memory | 96 GB | `nvidia-smi` on DeltaAI ("GH200 120GB" shows ~96 GB usable HBM).
+gpu_memory_gb = 96
+# Leave 10% for the CUDA context, NCCL buffers and fragmentation | ASSUMPTION.
+usable_fraction = 0.9
+# Language-model parameters of Qwen3.5-4B, billions | 4.2 | counted from config.json @ 851bf6e8
+# (embedding 0.64 tied + MLP 2.27 + 8 full-attention layers 0.29 + 24 linear-attention layers 1.01).
+params_total_billion = 4.2
+# Of those, not split by tensor parallel: the 24 linear-attention layers | 1.0 | as above.
+params_replicated_billion = 1.0
+# Activations with full recompute + temporaries | 12 GB | ASSUMPTION (layer inputs 32 x 36,864 x
+# 2,560 x 2 bytes / TP ~ 3 GB, plus one layer recomputed at a time).
+activation_reserve_gb = 12
+
+[smoke]
+# The smoke run (scripts/deltaai/smoke_train.sh): real slime training with THIS config, changed
+# only in the step count, the validation interval/size and the checkpoint interval | Experiment-3.
+steps = 2
+# Worst-case memory test | the first answer of each of the first N groups of the run ignores the
+# end-of-text token and runs to [rollout] max_response_len (SGLang `ignore_eos`), so step 1 trains
+# on full-length sequences (34,816 tokens) | N = 32 = [algorithm] over_sampling_batch_size, i.e.
+# every group of the first sampling round | smoke run ONLY (src/slime_hooks.py reads it from
+# $GAR_SMOKE_FORCE_MAX_LEN_GROUPS, which only smoke_train.sh sets); src/check_smoke.py requires a
+# full-length answer in a group step 1 trained on. Its checkpoint is deleted after the run.
+force_max_len_groups = 32
+eval_questions = 16
+serve_questions = 1
+serve_max_new_tokens = 2048
