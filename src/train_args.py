@@ -307,6 +307,39 @@ def check_all(cfg: dict, control: dict) -> None:
     check_hardware(cfg)
 
 
+def check_data(cfg: dict, out_dir: Path) -> None:
+    """The slime input files must be built from the CURRENT prompts and settings (review 2026-11-24).
+
+    src/train_prep.py bakes the prompt text into train.jsonl / val.jsonl. If src/prompts.py changes
+    (the final few-shot / reworded reinit prompt) and train_prep is not rerun, training would
+    silently use the old prompt while the control uses the new one. Its manifest records the prompt
+    hash, mode, salt, length cap and output hashes; any difference, or a half-copied file, stops here.
+    """
+    from src import prompts   # standard library only; the prompt text lives there
+    from src.train_data import sha256_file
+    man_path = out_dir / "manifest.json"
+    if not man_path.exists():
+        raise FileNotFoundError(f"{man_path} not found: run `python3 -m src.train_prep` (and copy its output)")
+    man = json.loads(man_path.read_text())
+    rerun = "rerun `python3 -m src.train_prep --overwrite` and copy the output"
+    if man.get("prompt_hash") != prompts.PROMPT_HASH:
+        raise ValueError(f"{out_dir} was built with prompt hash {man.get('prompt_hash')!r}, but src/prompts.py "
+                         f"is now {prompts.PROMPT_HASH!r}: {rerun}")
+    for key in ("prompt_mode", "shuffle_salt"):
+        if man.get(key) != cfg["data"][key]:
+            raise ValueError(f"{out_dir} was built with {key} {man.get(key)!r}, config says "
+                             f"{cfg['data'][key]!r}: {rerun}")
+    checks = man.get("checks", {})
+    cap = cfg["rollout"]["max_prompt_len"]
+    if checks.get("prompt_tokens_max") is None or checks["prompt_tokens_max"] > cap:
+        raise ValueError(f"{out_dir}: longest prompt {checks.get('prompt_tokens_max')} tokens > [rollout] "
+                         f"max_prompt_len {cap} (slime would drop it silently): {rerun}")
+    for split, want in man.get("outputs_sha256", {}).items():
+        f = out_dir / f"{split}.jsonl"
+        if not f.exists() or sha256_file(f) != want:
+            raise ValueError(f"{f} is missing or differs from its manifest (half-copied or edited?): {rerun}")
+
+
 # ---------------------------------------------------------------- flag building
 def _flag_value(v) -> str:
     if isinstance(v, bool):
@@ -582,6 +615,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(f"[train_args] {e}")
     check_all(cfg, control)
     check_hf_config(cfg, Path(args.hf_checkpoint) / "config.json")
+    check_data(cfg, REPO_ROOT / cfg["data"]["output_dir"])
     mem = memory_estimate_gb(cfg)
     print(f"[train_args] memory estimate per training GPU: {mem['total']:.0f} GB of {mem['limit']:.0f} "
           f"(model state {mem['model_state']:.0f}, logits {mem['logits']:.0f}, activations {mem['activations']:.0f}); "

@@ -18,6 +18,7 @@ import re
 import tempfile
 from pathlib import Path
 
+from src import train_args
 from src.config import REPO_ROOT, load_config
 from src.train_args import (FORBIDDEN_FLAGS, HF_CONFIG_KEYS, PARSED_NAME, _flag_value, build_args,
                             check_against_control, check_algorithm, check_all, check_flags, check_hardware,
@@ -78,17 +79,17 @@ def test_training_targets_qwen35_4b_and_refuses_the_2b_control():
 
 
 def test_missing_control_config_is_refused_with_a_clear_message():
-    """[run] control_config names the 4B control; until it exists, nothing can be built."""
-    if (REPO_ROOT / CFG["run"]["control_config"]).exists():
-        return "SKIP: the 4B control config exists now"
+    """[run] control_config names the 4B control; if it is missing, nothing can be built.
+    Tested with a path that never exists, so the test runs whether or not configs/control_4b.toml does."""
+    missing = str(Path(tempfile.mkdtemp()) / "control_missing.toml")
     try:
-        load_control_for(CFG)
+        load_control_for(CFG, missing)
     except FileNotFoundError as e:
         assert "control_config" in str(e)
     else:
         raise AssertionError("expected FileNotFoundError")
     try:
-        main(["--hf-checkpoint", tempfile.mkdtemp(), "--check"])
+        main(["--hf-checkpoint", tempfile.mkdtemp(), "--check", "--control-config", missing])
     except SystemExit as e:
         assert "control config" in str(e)
     else:
@@ -105,7 +106,55 @@ def test_check_mode_passes_with_a_matching_control_and_config_json():
         src, n = re.subn(rf'(?m)^{key} = ".*"$', f'{key} = "{new}"', src, count=1)
         assert n == 1, key
     ctl.write_text(src)
-    main(["--hf-checkpoint", str(d), "--check", "--control-config", str(ctl)])   # no exception = pass
+    real_check_data = train_args.check_data
+    train_args.check_data = lambda cfg, out_dir: None   # the data files are tested on their own below
+    try:
+        main(["--hf-checkpoint", str(d), "--check", "--control-config", str(ctl)])   # no exception = pass
+    finally:
+        train_args.check_data = real_check_data
+
+
+# ---------------------------------------------------------------- the slime input files (review 2026-11-24)
+def _built_data(**manifest_changes):
+    """A fake train_prep output folder whose manifest matches the current prompts and config."""
+    from src import prompts
+    from src.train_data import sha256_file
+    d = Path(tempfile.mkdtemp())
+    for split in ("train", "val"):
+        (d / f"{split}.jsonl").write_text(json.dumps({"text": "x", "label": "A"}) + "\n")
+    man = {"prompt_hash": prompts.PROMPT_HASH, "prompt_mode": CFG["data"]["prompt_mode"],
+           "shuffle_salt": CFG["data"]["shuffle_salt"],
+           "checks": {"prompt_tokens_max": 1000, "max_prompt_len": CFG["rollout"]["max_prompt_len"]},
+           "outputs_sha256": {s: sha256_file(d / f"{s}.jsonl") for s in ("train", "val")}}
+    man.update(manifest_changes)
+    (d / "manifest.json").write_text(json.dumps(man))
+    return d
+
+
+def test_data_built_from_the_current_prompts_passes():
+    train_args.check_data(CFG, _built_data())
+
+
+def test_data_built_from_an_older_prompt_is_refused():
+    """The final prompts will change src/prompts.py: training must not run on data built before."""
+    assert raises(train_args.check_data, CFG, _built_data(prompt_hash="0000000000000000"))
+    assert raises(train_args.check_data, CFG, _built_data(prompt_mode="default"))
+    assert raises(train_args.check_data, CFG, _built_data(shuffle_salt="other"))
+
+
+def test_prompts_longer_than_the_cap_are_refused():
+    """Few-shot examples lengthen the prompt; slime would drop over-long prompts silently."""
+    long = {"prompt_tokens_max": CFG["rollout"]["max_prompt_len"] + 1}
+    assert raises(train_args.check_data, CFG, _built_data(checks=long))
+
+
+def test_half_copied_or_missing_data_is_refused():
+    d = _built_data()
+    (d / "val.jsonl").write_text("")                     # truncated copy
+    assert raises(train_args.check_data, CFG, d)
+    d = _built_data()
+    (d / "manifest.json").unlink()
+    assert raises(train_args.check_data, CFG, d)
 
 
 def test_previous_experiment_values_are_kept():
