@@ -143,9 +143,14 @@ rollout_batch_size = 16
 global_batch_size = 128
 # Longest answer | 32,768 tokens | user, 2026-11-17.
 max_response_len = 32768
-# Longest prompt | 2,048 tokens | src/train_prep.py refuses longer prompts. Few-shot examples in
-# the new prompts will make prompts longer: train_prep reports the longest; raise this if needed.
-max_prompt_len = 2048
+# Longest prompt | 2,304 tokens | user, 2026-11-27 (was 2,048, Experiment-3). The few-shot reinit
+# prompt (branch few_shot_examples, c4d025e) adds 536 tokens: the longest of the 5,733 training +
+# validation prompts is then 2,156 (4B tokenizer), 1 over 2,048. 2,304 = 2,048 + 256 leaves ~150
+# tokens of room for wording changes. Costs nothing: 2,304 + 32,768 = 35,072 still fits
+# [hardware] max_tokens_per_gpu (36,864; checked), so the memory estimate is unchanged.
+# src/train_prep.py refuses longer prompts; train_args.check_data refuses data whose longest
+# prompt exceeds this.
+max_prompt_len = 2304
 # Shuffle question order each epoch, with this seed | slime default 42.
 shuffle = true
 shuffle_seed = 42
@@ -293,7 +298,7 @@ sglang_mem_fraction_static = 0.7
 # (no FA3 in the arm64 image; smoke jobs 3611059 and 3633318).
 sglang_attention_backend = "flashinfer"
 sglang_mm_attention_backend = "triton_attn"
-# Tokens per micro-batch per training GPU | 36,864 (one 2,048 + 32,768 sequence) | Experiment-3 |
+# Tokens per micro-batch per training GPU | 36,864 (Experiment-3: one 2,048 + 32,768 sequence; now 2,304 + 32,768 = 35,072 fits) |
 # must be >= max_prompt_len + max_response_len (checked): a longer sequence would sit alone in
 # its own bigger micro-batch (slime dp_schedule), outside the memory estimate.
 max_tokens_per_gpu = 36864

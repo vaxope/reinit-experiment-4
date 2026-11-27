@@ -163,7 +163,7 @@ def test_previous_experiment_values_are_kept():
     expected = {
         "--n-samples-per-prompt": "8", "--rollout-batch-size": "16", "--global-batch-size": "128",
         "--rollout-max-response-len": "32768", "--eval-max-response-len": "32768",
-        "--rollout-max-prompt-len": "2048",
+        "--rollout-max-prompt-len": "2304",   # user, 2026-11-27: raised from 2,048 for the few-shot prompts
         "--optimizer": "adam", "--lr": "1e-06", "--lr-decay-style": "constant", "--lr-warmup-iters": "0",
         "--adam-beta1": "0.9", "--adam-beta2": "0.999", "--adam-eps": "1e-08",
         "--weight-decay": "0.01", "--clip-grad": "1.0",
