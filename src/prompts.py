@@ -69,13 +69,33 @@ MCQ_FORMAT_INSTRUCTION = (
     'e.g., `"answer": "C"`.'
 )
 
-# The user-turn text of think and default. Identical for those two modes: the ONLY
-# difference between them is the assistant prefix above. Any edit here changes every
-# input => new run name.
-# Layout: one-line task statement, the question, lettered options, then the format
-# instruction last (the card gives no placement; last keeps it closest to generation).
+# Short, domain-spanning examples teach the answer format without using GPQA questions.
+# These examples are shared by Think and Default so their user prompts remain identical.
+FEW_SHOT_EXAMPLES = (
+    "Example 1\n"
+    "Question: A 2.0 kg object experiences a net force of 6.0 N. What is its acceleration?\n"
+    "A) 0.33 m/s^2\nB) 3.0 m/s^2\nC) 8.0 m/s^2\nD) 12.0 m/s^2\n"
+    "Example response:\n"
+    '{{"answer": "B"}}\n\n'
+    "Example 2\n"
+    "Question: An atom has 17 protons and 18 neutrons. What is its atomic number?\n"
+    "A) 17\nB) 18\nC) 35\nD) 1\n"
+    "Example response:\n"
+    '{{"answer": "A"}}\n\n'
+    "Example 3\n"
+    "Question: Which molecule carries amino acids to the ribosome during translation?\n"
+    "A) mRNA\nB) rRNA\nC) DNA\nD) tRNA\n"
+    "Example response:\n"
+    '{{"answer": "D"}}\n\n'
+)
+
+# The user-turn text of Think and Default. These modes share the exact same user prompt;
+# their only experimental difference is the assistant prefix (thinking enabled vs disabled).
 QUESTION_PROMPT = (
     "Answer the following multiple-choice question.\n\n"
+    "Use these examples as a guide to the required final-answer format.\n\n"
+    + FEW_SHOT_EXAMPLES
+    + "Now answer the following question.\n\n"
     "Question: {question}\n\n{options}\n\n"
     + MCQ_FORMAT_INSTRUCTION
 )
@@ -90,23 +110,58 @@ REINIT_SYSTEM_PROMPT = (
     "multiple-choice problems."
 )
 
-# User turn of reinit: the task, the three analysis steps, where the answer goes, then the
-# same question/options layout and the SAME answer instruction as the other modes (so
-# extraction and the question block are identical across all three modes).
-# Changes from the user's draft: "these fields" now refers to the system persona; the
-# first, curly-quoted answer instruction is removed (the extractor needs straight quotes);
-# "Questions:" -> "Question:"; options use the shared "A) ..." block; the answer is
-# explicitly placed after </analysis>.
+# Reinit examples demonstrate the requested three-step analysis, the closing marker, and
+# the same single-line JSON answer format used in Think and Default. They are synthetic
+# examples, not questions drawn from GPQA Diamond.
+REINIT_FEW_SHOT_EXAMPLES = (
+    "Example 1 (physics)\n"
+    "Question: A 2.0 kg object experiences a net force of 6.0 N. What is its acceleration?\n"
+    "A) 0.33 m/s^2\nB) 3.0 m/s^2\nC) 8.0 m/s^2\nD) 12.0 m/s^2\n"
+    "<analysis>\n"
+    "1. Deconstruct: The problem gives the net force and mass and asks for acceleration.\n"
+    "2. Derivation: Newton's second law gives a = F/m = 6.0/2.0 = 3.0 m/s^2, which is option B.\n"
+    "3. Verification: N/kg is equivalent to m/s^2, so the units and calculated value match option B.\n"
+    "</analysis>\n"
+    '{{"answer": "B"}}\n\n'
+    "Example 2 (chemistry)\n"
+    "Question: An atom has 17 protons and 18 neutrons. What is its atomic number?\n"
+    "A) 17\nB) 18\nC) 35\nD) 1\n"
+    "<analysis>\n"
+    "1. Deconstruct: Atomic number is determined by the number of protons; neutrons do not set it.\n"
+    "2. Derivation: The atom has 17 protons, so its atomic number is 17, which is option A.\n"
+    "3. Verification: The mass number would be 17 + 18 = 35, but the question asks for atomic number. Option A is correct.\n"
+    "</analysis>\n"
+    '{{"answer": "A"}}\n\n'
+    "Example 3 (biology)\n"
+    "Question: Which molecule carries amino acids to the ribosome during translation?\n"
+    "A) mRNA\nB) rRNA\nC) DNA\nD) tRNA\n"
+    "<analysis>\n"
+    "1. Deconstruct: The question asks which molecule delivers amino acids to the ribosome during protein synthesis.\n"
+    "2. Derivation: Transfer RNA (tRNA) carries specific amino acids to the ribosome, so option D is correct.\n"
+    "3. Verification: mRNA carries the codon sequence, while tRNA brings amino acids; therefore D matches the described role.\n"
+    "</analysis>\n"
+    '{{"answer": "D"}}\n\n'
+)
+
+# Reinit's assistant prefix already opens <analysis>. The user prompt tells the model to
+# continue that block, close it once, and place the final answer outside it.
 REINIT_QUESTION_PROMPT = (
     "Your task is to solve a highly challenging, graduate-level multiple-choice problem in "
-    "one of these fields.\n\n"
-    "First, reason through the problem inside " + ANALYSIS_OPEN + ANALYSIS_CLOSE + ":\n"
-    "1. Deconstruct the problem: identify the scientific principles, constraints, specific "
-    "conditions, and core theoretical mechanisms involved.\n"
-    "2. Multi-step derivation: work through the problem systematically, performing any "
-    "mathematical derivations, mechanism deductions, or theoretical evaluations step by step.\n"
-    "3. Verification: double-check your logic, unit conversions, and theoretical assumptions.\n\n"
-    "After " + ANALYSIS_CLOSE + ", give your final choice.\n\n"
+    "chemistry, biology, or physics.\n\n"
+    "Continue writing inside the <analysis> block that has already been opened for you. "
+    "Do not write another opening <analysis> tag.\n"
+    "Complete these three steps in order inside that block:\n"
+    "1. Deconstruct: identify the scientific principles, constraints, specific conditions, "
+    "and core theoretical mechanisms involved.\n"
+    "2. Derivation: work through the problem systematically, showing relevant calculations, "
+    "mechanism deductions, or theoretical reasoning.\n"
+    "3. Verification: check the result, including logic, units, and assumptions.\n\n"
+    "After step 3, generate the closing tag </analysis> exactly once, on its own line. "
+    "Do not leave the analysis block open or start another analysis block. "
+    "Put the final answer only after </analysis>.\n\n"
+    "The examples show the required analysis structure and final-answer format.\n\n"
+    + REINIT_FEW_SHOT_EXAMPLES
+    + "Now solve the following question.\n\n"
     "Question: {question}\n\n{options}\n\n"
     + MCQ_FORMAT_INSTRUCTION
 )
