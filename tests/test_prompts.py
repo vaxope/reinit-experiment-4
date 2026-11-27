@@ -23,12 +23,39 @@ def test_modes_differ_only_in_assistant_prefix():
     assert think == common + "<think>\n" and default == common + "<think>\n\n</think>\n\n"
 
 
+def _filled(template_part):
+    """A piece of a .format template as it appears in the built prompt ({{ -> {, }} -> })."""
+    return template_part.replace("{{", "{").replace("}}", "}")
+
+
 def test_user_text_layout():
+    # Few-shot prompts (partner, 2026-11-27, branch few_shot_examples): task line, the
+    # examples, then the question block and the answer instruction last, as before.
     u = prompts.user_text(Q, ["w", "x", "y", "z"])
     assert u == ("Answer the following multiple-choice question.\n\n"
+                 "Use these examples as a guide to the required final-answer format.\n\n"
+                 + _filled(prompts.FEW_SHOT_EXAMPLES)
+                 + "Now answer the following question.\n\n"
                  "Question: Which is largest?\n\nA) w\nB) x\nC) y\nD) z\n\n"
                  'Please show your choice in the `answer` field with only the choice letter, '
                  'e.g., `"answer": "C"`.')
+
+
+def test_every_few_shot_example_is_read_by_the_answer_extractor():
+    """Each example ends in an answer the official rule (v3) reads, and in reinit after a closed
+    </analysis>: the examples must show a format that scores, or they teach the wrong one."""
+    from src import extract
+    for mode, examples in (("default", prompts.FEW_SHOT_EXAMPLES), ("reinit", prompts.REINIT_FEW_SHOT_EXAMPLES)):
+        blocks = [b for b in _filled(examples).split("\n\n") if b.strip()]
+        assert len(blocks) == 3, mode
+        for b in blocks:
+            if mode == "reinit":
+                assert b.count("</analysis>") == 1
+                response = b[b.index("<analysis>\n") + len("<analysis>\n"):]   # what follows the prefix
+            else:
+                response = b.split("Example response:\n", 1)[1]
+            got = extract.extract_answer(response, mode)
+            assert got["letter"] in ("A", "B", "C", "D") and got["n_strict_fields"] == 1, (mode, b[:40])
 
 
 def test_format_instruction_is_qwen_verbatim():
@@ -118,7 +145,12 @@ def test_reinit_user_text_shares_question_block_and_answer_instruction():
     assert prompts.user_text(Q, opts, "reinit").endswith(shared)
     assert prompts.user_text(Q, opts, "think").endswith(shared)
     u = prompts.user_text(Q, opts, "reinit")
-    assert "<analysis></analysis>" in u and "After </analysis>, give your final choice." in u
+    # the reworded reinit instructions (2026-11-27): continue the opened block, close it once,
+    # answer only after it; then the reinit examples, then the shared question block
+    assert "Continue writing inside the <analysis> block that has already been opened for you." in u
+    assert "generate the closing tag </analysis> exactly once" in u
+    assert "Put the final answer only after </analysis>." in u
+    assert _filled(prompts.REINIT_FEW_SHOT_EXAMPLES) + "Now solve the following question.\n\n" + shared in u
     assert "\u201c" not in u and "\u201d" not in u  # no curly quotes anywhere
 
 

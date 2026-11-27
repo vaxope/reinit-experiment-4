@@ -1,6 +1,6 @@
 # configs/control.toml: every parameter of the control (baseline) run.
 #
-# Purpose : single source of truth for the control run of untrained Qwen3.5-2B on
+# Purpose : single source of truth for the control run of untrained Qwen3.5-4B on
 #           GPQA Diamond in three modes (think, default, reinit). No other file hard-codes
 #           these values; they read them via src/config.py.
 # Inputs  : none (hand-edited).
@@ -17,18 +17,22 @@
 # Each value: meaning | value source | reason.
 
 [model]
-# Hugging Face model id | CLAUDE.md control-run spec.
-name = "Qwen/Qwen3.5-2B"
+# Hugging Face model id | user, 2026-11-19 (the control run moves from the 2B to the 4B;
+# the 2B run control_v1 used Qwen/Qwen3.5-2B @ 15852e8c).
+name = "Qwen/Qwen3.5-4B"
 # Exact commit of the model repo, so weights + chat template cannot change under us.
-# Source: https://huggingface.co/api/models/Qwen/Qwen3.5-2B "sha", read 2026-11-13
-# (lastModified 2026-03-02). Re-check before the first DeltaAI run.
-revision = "15852e8c16360a2fea060d615a32b45270f8a8fc"
-# Weight precision | CLAUDE.md ("bf16") | the model's native dtype; ~5 GB on GPU.
+# Source: HF `main` on 2026-11-24 (lastModified 2026-03-02); the snapshot in the HF cache
+# (setup.sh downloads it on DeltaAI). The training config pins the same commit.
+revision = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+# Weight precision | the model's native dtype; ~9 GB on GPU.
 dtype = "bfloat16"
 # SHA-256 of the official chat template shipped with the tokenizer at `revision`.
 # src/generate.py refuses to run if the loaded tokenizer's template differs, so a changed
-# template can never slip in unnoticed. Computed 2026-11-13 with transformers 5.23.0.
-chat_template_sha256 = "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+# template can never slip in unnoticed. Recomputed 2026-11-27 from chat_template.jinja @ 851bf6e8.
+# Differs from the 2B's (273d8e0e...): the 4B template turns thinking ON when enable_thinking
+# is not given (the 2B's turns it off). src/prompts.py always passes enable_thinking, so the
+# built prompts follow the same rules; template parity checks this.
+chat_template_sha256 = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
 
 [data]
 # Gated HF dataset repo holding GPQA | GPQA authors' official release.
@@ -66,12 +70,13 @@ shuffle_salt = "gpqa-control-v1"
 [sampling]
 # STATUS: CONFIRMED by the user 2026-11-13. Only used later by src/generate.py.
 # ONE setting for ALL modes, so the only difference between think and default is the
-# assistant prefix (and reinit differs only by its prompt). Values = Qwen3.5-2B model card, "thinking mode, text tasks":
+# assistant prefix (and reinit differs only by its prompt). Values = Qwen3.5-4B model card
+# @ 851bf6e8, "thinking mode for general tasks" (the same values the 2B card gave):
 #   temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0
-# The card recommends different values for non-thinking text tasks (top_p=1.0,
-# presence_penalty=2.0); deliberately NOT used, so default mode runs slightly off its
-# recommended setting. The card also warns the 2B model is prone to thinking loops with
-# these values: watch the think-mode truncation rate in the pilot.
+# For non-thinking reasoning tasks the 4B card contradicts itself: its tip box gives exactly
+# these values, its Best Practices list gives top_p=1.0, top_k=40, presence_penalty=2.0. The
+# latter is deliberately NOT used (one setting for all modes). Watch the think-mode truncation
+# rate in the pilot.
 status = "confirmed"
 temperature = 1.0         # no rescaling of the model's distribution
 top_p = 0.95              # sample only from the smallest token set holding 95% probability
@@ -83,9 +88,10 @@ repetition_penalty = 1.0  # off (1.0 = no change)
 [generation]
 # Used by src/generate.py.
 # Max new tokens, SAME for all modes. CONFIRMED by the user 2026-11-13: 81,920, so
-# thinking is effectively unrestricted. Source: Qwen3.5-2B model card, "For benchmarking on
+# thinking is effectively unrestricted. Source: Qwen3.5-4B model card (same as the 2B's), "For benchmarking on
 # highly complex problems ... we suggest setting the max output length to 81,920 tokens."
-# Longest GPQA prompt is 2,789 tokens, so prompt + output stays far below the model's
+# Longest GPQA prompt is 3,463 tokens (reinit, few-shot prompts, 4B tokenizer; measured
+# 2026-11-27; think 3,007, default 3,009), so prompt + output stays far below the model's
 # 262,144-token context. Truncation rate is still reported.
 max_new_tokens = 81920
 # Samples per (question, mode) | CLAUDE.md proposal; final value decided after the pilot.
@@ -151,7 +157,7 @@ random_seed = 0
 # refuses pilot/control runs if the server reports a different backend. Fallback: "triton".
 attention_backend = "flashinfer"
 # Attention kernel for the model's VISION encoder (passed as --mm-attention-backend).
-# Qwen3.5-2B is multimodal; SGLang builds and warms up its vision tower at startup even
+# Qwen3.5-4B is multimodal (config.json has a vision_config); SGLang builds and warms up its vision tower at startup even
 # though our prompts are text-only, and on Hopper it auto-picks FA3 for it -> the same
 # missing sgl_kernel FA3 module crashed startup (smoke job 3611286, 2026-11-15). Source:
 # sglang v0.5.23 layers/attention/vision.py _determine_attention_backend. "triton_attn" is

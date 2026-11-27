@@ -15,6 +15,11 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# The fake server serves the model configs/control.toml names, so generate.py's model check
+# passes whichever model the control run uses.
+sys.path.insert(0, str(ROOT))
+from src.config import load_config  # noqa: E402
+MODEL = load_config()["model"]
 QUESTIONS = [{"qid": f"recTEST{i:02d}", "question": f"Synthetic question {i}: pick the largest.",
               "correct": "42", "wrong": ["7", "13", "21"], "domain": "Test", "subdomain": "Test"}
              for i in range(4)]
@@ -39,8 +44,8 @@ def _free_port():
 class FakeServer:
     def __init__(self, *extra):
         self.port = _free_port()
-        self.proc = subprocess.Popen([sys.executable, "-m", "tests.fake_sglang", "--model-path", "Qwen/Qwen3.5-2B",
-                                      "--revision", "15852e8c16360a2fea060d615a32b45270f8a8fc",
+        self.proc = subprocess.Popen([sys.executable, "-m", "tests.fake_sglang", "--model-path", MODEL["name"],
+                                      "--revision", MODEL["revision"],
                                       "--port", str(self.port), "--fake-load-s", "0.5", *extra],
                                      cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.url = f"http://127.0.0.1:{self.port}"
@@ -91,7 +96,7 @@ def test_end_to_end_records_resume_and_score():
                 # the counted tokens end exactly at "</analysis>"
                 head = r["output_token_ids"][:r["n_analysis_tokens"]]
                 from transformers import AutoTokenizer
-                tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-2B", revision=r["model_revision"])
+                tok = AutoTokenizer.from_pretrained(r["model"], revision=r["model_revision"])
                 assert tok.decode(head).endswith("</analysis>")
                 assert r["input_text"].startswith("<|im_start|>system\n")
         # same (qid, sample) -> same option order and gold in every mode
