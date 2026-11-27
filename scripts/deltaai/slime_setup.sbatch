@@ -29,10 +29,14 @@
 # Rerun after a smoke-run failure (user, 2026-11-19): when <folder>.setup_pass exists, the passed
 # Megatron copy is kept and steps 2-3 are skipped; steps 1 and 4 (GPU check, flag check, ~2 min)
 # run again because they depend on the node and on the current config, then step 5.
-# Output: $SLIME_CKPT_DIR/<model>_<rev>_torch_dist (about 5 GB). Never overwritten: if it exists
-# WITHOUT the marker, the job stops (delete it yourself to redo the conversion). On success it also writes the marker
-# <that folder>.setup_pass (job, git, date): training refuses a Megatron copy without it, so a
-# half-finished conversion is never trained on (setup_and_train.sbatch skips setup when it exists).
+# Output: $SLIME_CKPT_DIR/<model>_<rev>_torch_dist (about 8 GB). Never overwritten: if it exists
+# WITHOUT the marker, the job stops (delete it yourself to redo the conversion). As soon as the
+# round trip (step 3) passes, it writes the marker <that folder>.setup_pass (job, git, date) =
+# "this Megatron copy is verified": training refuses a copy without it, so a half-finished
+# conversion is never trained on. Written after step 3, not after step 4 (job 3686748: the flag
+# check failed after a good conversion, and the unmarked 7.9 GB copy then blocked the rerun):
+# step 4 reruns every time anyway. The flag check's own proof is the smoke run's marker
+# (.smoke_pass), which only step 5 writes, after step 4 passed in the same job.
 #SBATCH --job-name=gar-slime-setup
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -101,6 +105,8 @@ rm -rf "$RT_DIR"   # temporary copy made by this job
 if [ "$RT_STATUS" -ne 0 ]; then
   echo "[setup] FAIL: the round trip changed weights; do not train on $REF_DIR"; exit 1
 fi
+echo "job ${SLURM_JOB_ID:-local} | git $(git rev-parse --short HEAD) | $(date -u +%FT%TZ)" > "$REF_DIR.setup_pass"
+echo "[setup] Megatron copy verified (marker $REF_DIR.setup_pass)"
 fi   # steps 2-3
 
 # ---- 4
@@ -108,12 +114,12 @@ S python3 -m src.train_args --hf-checkpoint "$HF_SNAPSHOT" --ref-load "$REF_DIR"
   --save "$SLIME_CKPT_DIR/$RUN_NAME" --update-weight-disk-dir "$SLIME_CKPT_DIR/_weight_sync_$RUN_NAME" \
   --out "runs/$RUN_NAME/slime_args_setup.txt" > /dev/null
 echo "[setup] training flags built ($(wc -l < "runs/$RUN_NAME/slime_args_setup.txt") lines, runs/$RUN_NAME/slime_args_setup.txt)"
-S env GAR_TRAIN_CONFIG="$REPO_DIR/configs/train_reinit.toml" PYTHONPATH="/opt/Megatron-LM" \
+# CUDA_DEVICE_MAX_CONNECTIONS=1: the value train_inside.sh exports for training. Megatron's
+# validate_args (ae76c60e) refuses tensor parallel > 1 without it (setup job 3686748), so the check
+# must parse with the same environment training runs with.
+S env GAR_TRAIN_CONFIG="$REPO_DIR/configs/train_reinit.toml" PYTHONPATH="/opt/Megatron-LM" CUDA_DEVICE_MAX_CONNECTIONS=1 \
   python3 scripts/deltaai/check_slime_args.py "runs/$RUN_NAME/slime_args_setup.txt"
-if [ "$REUSE" -eq 0 ]; then
-  echo "job ${SLURM_JOB_ID:-local} | git $(git rev-parse --short HEAD) | $(date -u +%FT%TZ)" > "$REF_DIR.setup_pass"
-fi
-echo "[setup] $(date -u +%FT%TZ) PASS (marker $REF_DIR.setup_pass)"
+echo "[setup] $(date -u +%FT%TZ) PASS: steps 0-4 (Megatron copy, marker $REF_DIR.setup_pass)"
 
 # ---- 5
 bash scripts/deltaai/smoke_train.sh

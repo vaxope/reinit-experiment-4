@@ -161,3 +161,24 @@ def test_every_slime_image_gpu_command_goes_through_slime_env():
     assert "slime_env.sh" in gpu_line
     gpu_src = (REPO_ROOT / "scripts" / "deltaai" / "check_slime_gpu.py").read_text()
     assert "check_cudnn):" in gpu_src   # the consistency check runs last, after TE has loaded cuDNN
+
+
+def test_flag_check_parses_with_trainings_cuda_device_max_connections():
+    """Megatron refuses tensor parallel > 1 unless CUDA_DEVICE_MAX_CONNECTIONS=1 (setup job 3686748):
+    the setup job's flag check must set the same value train_inside.sh exports for training."""
+    deltaai = REPO_ROOT / "scripts" / "deltaai"
+    inside = re.search(r"^export .*CUDA_DEVICE_MAX_CONNECTIONS=(\S+)", (deltaai / "train_inside.sh").read_text(), re.M)
+    assert inside, "train_inside.sh no longer exports CUDA_DEVICE_MAX_CONNECTIONS"
+    setup = (deltaai / "slime_setup.sbatch").read_text()
+    call = setup[setup.rindex("\nS env", 0, setup.index("check_slime_args.py \"")):setup.index("check_slime_args.py \"")]
+    assert f"CUDA_DEVICE_MAX_CONNECTIONS={inside.group(1)}" in call
+
+
+def test_setup_marker_is_written_once_the_round_trip_passed():
+    """setup_pass = "this Megatron copy is verified": written right after the round-trip check, before
+    the flag check (step 4), so a step-4 failure does not leave an unmarked copy that blocks the
+    rerun (job 3686748). Only one write, inside the conversion branch (not on a reuse)."""
+    s = (REPO_ROOT / "scripts" / "deltaai" / "slime_setup.sbatch").read_text()
+    writes = [m.start() for m in re.finditer(r'> "\$REF_DIR\.setup_pass"', s)]
+    assert len(writes) == 1
+    assert s.index('"$RT_STATUS" -ne 0') < writes[0] < s.index("fi   # steps 2-3") < s.index("# ---- 4")
