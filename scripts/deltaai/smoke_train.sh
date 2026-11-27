@@ -46,6 +46,17 @@ SMOKE_ID="smoke_train_$JOB"
 SMOKE_DIR="runs/$SMOKE_ID"
 SAVE_DIR="$SLIME_CKPT_DIR/_$SMOKE_ID"
 if [ -e "$SAVE_DIR" ]; then echo "[smoke-train] $SAVE_DIR already exists; not overwriting"; exit 1; fi
+# On a failure the smoke checkpoints are KEPT (for debugging; deleting outputs is the user's call),
+# but each one is ~60 GB with optimizer state on a 500 GB project quota shared by the whole project
+# (simulation 2026-11-27: three failed attempts left three folders behind, silently). Say so.
+report_leftovers() {
+  local status=$?
+  if [ "$status" -ne 0 ] && [ -e "$SAVE_DIR" ]; then
+    echo "[smoke-train] FAILED (exit $status). Left on disk: $SAVE_DIR ($(du -sh "$SAVE_DIR" 2>/dev/null | cut -f1))."
+    echo "[smoke-train] When no longer needed for debugging: rm -rf $SAVE_DIR"
+  fi
+}
+trap report_leftovers EXIT
 mkdir -p "$SMOKE_DIR/rollouts"
 T0=$SECONDS
 

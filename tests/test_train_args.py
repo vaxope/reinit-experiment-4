@@ -215,6 +215,17 @@ def test_dapo_values_are_read_from_the_config_not_hard_coded():
                  "--dynamic-sampling-filter-path") == fallback
 
 
+
+def test_drop_limit_below_one_sampling_round_is_refused():
+    """max_consecutive_dropped_groups < over_sampling_batch_size would stop a healthy first round."""
+    bad = changed("algorithm", max_consecutive_dropped_groups=CFG["algorithm"]["over_sampling_batch_size"] - 1)
+    try:
+        check_algorithm(bad)
+    except ValueError as e:
+        assert "max_consecutive_dropped_groups" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
 def test_inconsistent_dapo_settings_are_refused():
     bad = [("algorithm", dict(eps_clip_high=0.1)),                        # upper below lower
            ("algorithm", dict(eps_clip=0.0)),

@@ -179,6 +179,14 @@ dynamic_sampling_filter = "src.dapo_filters.check_correctness_varies"
 # Questions sampled per round while filling the batch | 32 (2 x rollout_batch_size) | PLACEHOLDER |
 # --over-sampling-batch-size; must be >= rollout_batch_size.
 over_sampling_batch_size = 32
+# Stop the run when this many finished groups IN A ROW had no learning signal (all right or all
+# wrong) | 160 = 5 sampling rounds of over_sampling_batch_size | review 2026-11-27: slime keeps
+# sampling with no round limit, so wrong start weights or a broken weight push (every answer
+# unparsable, all groups "all_wrong") or a collapsed model would spin until the job's time limit
+# (simulated: 1,600 groups dropped, nothing kept). src/dapo_filters.py raises instead, which ends
+# train.py with the reason. A healthy run cannot reach it by chance: even if 90% of groups had no
+# signal, 160 in a row has probability 0.9^160 ~ 5e-8. Must be >= over_sampling_batch_size.
+max_consecutive_dropped_groups = 160
 # KL penalty | off | PLACEHOLDER (DAPO drops it; Experiment-3 had k3 0.001) | --use-kl-loss.
 use_kl_loss = false
 kl_loss_type = "k3"

@@ -75,3 +75,57 @@ def test_reward_sets_the_attribute_the_filter_reads():
             os.environ.pop("GAR_ROLLOUT_LOG_DIR", None)
         else:
             os.environ["GAR_ROLLOUT_LOG_DIR"] = old
+
+
+def _with_limit(limit):
+    """Reset the drop streak and set its limit (normally read from the config once per process)."""
+    dapo_filters._STREAK.update(n=0, reasons={}, limit=limit)
+
+
+def test_limit_is_read_from_the_config():
+    _with_limit(None)
+    from src.train_args import load_train_config
+    assert dapo_filters.max_consecutive_drops() == \
+        load_train_config()["algorithm"]["max_consecutive_dropped_groups"]
+
+
+def test_run_stops_after_the_limit_of_dropped_groups_in_a_row():
+    """Review 2026-11-27: slime samples with no round limit; wrong weights make every group all_wrong."""
+    _with_limit(3)
+    try:
+        dapo_filters.check_correctness_varies(None, group(False, False))
+        dapo_filters.check_correctness_varies(None, group(True, True))
+        try:
+            dapo_filters.check_correctness_varies(None, group(False, False))
+        except RuntimeError as e:
+            assert "3 groups in a row" in str(e) and "'all_wrong': 2" in str(e) and "'all_correct': 1" in str(e)
+        else:
+            raise AssertionError("expected RuntimeError at the limit")
+    finally:
+        _with_limit(None)
+
+
+def test_a_kept_group_resets_the_streak():
+    _with_limit(3)
+    try:
+        for _ in range(5):   # drop, drop, keep, ... never 3 drops in a row
+            dapo_filters.check_correctness_varies(None, group(False, False))
+            dapo_filters.check_correctness_varies(None, group(False, False))
+            assert dapo_filters.check_correctness_varies(None, group(True, False)).keep is True
+        assert dapo_filters._STREAK["n"] == 0
+    finally:
+        _with_limit(None)
+
+
+def test_fallback_variant_counts_too():
+    _with_limit(2)
+    try:
+        dapo_filters.check_correctness_varies_with_fallback(None, group(False))
+        try:
+            dapo_filters.check_correctness_varies_with_fallback(None, group(False))
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected RuntimeError")
+    finally:
+        _with_limit(None)

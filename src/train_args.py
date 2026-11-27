@@ -100,7 +100,7 @@ REQUIRED = {
                 "max_response_len", "max_prompt_len", "shuffle", "shuffle_seed"],
     "algorithm": ["name", "advantage_estimator", "std_normalization", "eps_clip", "eps_clip_high",
                   "per_token_loss", "dynamic_sampling", "dynamic_sampling_filter",
-                  "over_sampling_batch_size", "use_kl_loss", "kl_loss_type", "kl_loss_coef",
+                  "over_sampling_batch_size", "max_consecutive_dropped_groups", "use_kl_loss", "kl_loss_type", "kl_loss_coef",
                   "entropy_coef", "use_tis"],
     "optimizer": ["optimizer", "lr", "lr_decay_style", "lr_warmup_iters", "adam_beta1",
                   "adam_beta2", "adam_eps", "weight_decay", "clip_grad"],
@@ -183,6 +183,9 @@ def check_algorithm(cfg: dict) -> None:
                              "groups that differ in length; use src.dapo_filters.check_correctness_varies")
         if al["over_sampling_batch_size"] < r["rollout_batch_size"]:
             raise ValueError("[algorithm] over_sampling_batch_size must be >= [rollout] rollout_batch_size")
+        if al["max_consecutive_dropped_groups"] < al["over_sampling_batch_size"]:
+            raise ValueError("[algorithm] max_consecutive_dropped_groups must be >= over_sampling_batch_size "
+                             "(at least one full sampling round before the run is stopped)")
     if al["use_kl_loss"] and al["kl_loss_coef"] <= 0:
         raise ValueError("[algorithm] use_kl_loss needs kl_loss_coef > 0")
     if not al["use_kl_loss"] and al["kl_loss_coef"] != 0:

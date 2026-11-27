@@ -19,10 +19,44 @@ Pipeline: SGLang answers -> src/reward.py (reward + gar_correct) -> [dapo_filter
           -> advantages -> training.
 Fails   : a Sample without gar_correct raises instead of guessing: it means the reward did not run
           or another reward function is wired in.
+          Stop rule (review 2026-11-27): slime keeps starting sampling rounds until the batch is
+          full, with no round limit (sglang_rollout.py generate_rollout_async). If no group ever
+          has a signal (wrong start weights or weight push: every answer unparsable; a broken
+          prompt; a collapsed model), the job would spin until its time limit. After
+          [algorithm] max_consecutive_dropped_groups dropped groups in a row, the filter raises,
+          which ends train.py with the counts and the likely causes. One process runs all of
+          slime's rollouts (the rollout manager), so a module-level counter sees every group.
 """
 from __future__ import annotations
 
+import os
+
 ATTR = "gar_correct"   # set by src/reward.reward_one
+_STREAK = {"n": 0, "reasons": {}, "limit": None}   # dropped groups in a row, by reason
+
+
+def max_consecutive_drops() -> int:
+    """[algorithm] max_consecutive_dropped_groups of the training config, read once per process."""
+    if _STREAK["limit"] is None:
+        from src.train_args import DEFAULT_TRAIN_CONFIG, load_train_config
+        cfg = load_train_config(os.environ.get("GAR_TRAIN_CONFIG", DEFAULT_TRAIN_CONFIG))
+        _STREAK["limit"] = cfg["algorithm"]["max_consecutive_dropped_groups"]
+    return _STREAK["limit"]
+
+
+def track_streak(keep: bool, reason: str | None) -> None:
+    """Count dropped groups in a row; raise when the limit is reached (see the header)."""
+    if keep:
+        _STREAK["n"], _STREAK["reasons"] = 0, {}
+        return
+    _STREAK["n"] += 1
+    _STREAK["reasons"][reason] = _STREAK["reasons"].get(reason, 0) + 1
+    if _STREAK["n"] >= max_consecutive_drops():
+        raise RuntimeError(
+            f"dynamic sampling: {_STREAK['n']} groups in a row had no learning signal ({_STREAK['reasons']}); "
+            "slime has no round limit, so the run would sample until its time limit. All 'all_wrong' usually "
+            "means unusable answers: wrong start weights or weight push (check the first rollout sample in the "
+            "log), a broken prompt, or a collapsed model. Limit: [algorithm] max_consecutive_dropped_groups.")
 
 
 def _output(keep: bool, reason: str | None, fallback: bool):
@@ -50,10 +84,13 @@ def group_correctness(samples) -> list[bool]:
 def _decide(samples):
     flags = group_correctness(samples)
     if all(flags):
-        return False, "all_correct"
-    if not any(flags):
-        return False, "all_wrong"
-    return True, None
+        keep, reason = False, "all_correct"
+    elif not any(flags):
+        keep, reason = False, "all_wrong"
+    else:
+        keep, reason = True, None
+    track_streak(keep, reason)
+    return keep, reason
 
 
 def check_correctness_varies(args, samples, **kwargs):

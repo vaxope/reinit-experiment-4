@@ -7,6 +7,7 @@
 #         scripts/deltaai/submit.sh build-slime      [--dry-run]   (slime training image, build_slime.sbatch)
 #         scripts/deltaai/submit.sh slime-setup      [--dry-run]   (config checks, weights -> Megatron + round
 #                                                                     trip, flag check, 2-step DAPO smoke run; 4 GPUs)
+#         scripts/deltaai/submit.sh diag-attn        [--dry-run]   (TE attention-gradient diagnosis, 1 GPU, report only)
 # (The long training run and the trained-model evaluation jobs are not ported yet.)
 #
 # It reads scripts/deltaai/env.sh (account, partition, time limits), prints exactly what will
@@ -34,7 +35,8 @@ case "$KIND" in
   full)  TIME="${FULL_TIME:-24:00:00}";  SCRIPT=scripts/deltaai/run_control.sbatch; JOB_ARGS=(--run-id "${2:-control_v1}") ;;
   build-slime) TIME="${BUILD_SLIME_TIME:-03:30:00}"; SCRIPT=scripts/deltaai/build_slime.sbatch; JOB_ARGS=() ;;
   slime-setup) TIME="${SLIME_SETUP_TIME:-03:00:00}"; SCRIPT=scripts/deltaai/slime_setup.sbatch; JOB_ARGS=() ;;
-  *) echo "usage: $0 smoke|pilot [RUN_ID]|full [RUN_ID]|build-slime|slime-setup [--dry-run]"; exit 2 ;;
+  diag-attn) TIME="${DIAG_ATTN_TIME:-00:20:00}"; SCRIPT=scripts/deltaai/diag_attention.sbatch; JOB_ARGS=() ;;
+  *) echo "usage: $0 smoke|pilot [RUN_ID]|full [RUN_ID]|build-slime|slime-setup|diag-attn [--dry-run]"; exit 2 ;;
 esac
 for v in DELTAAI_ACCOUNT DELTAAI_PARTITION; do
   case "${!v:-}" in ""|"<"*) echo "$v is not set in scripts/deltaai/env.sh"; exit 1 ;; esac
@@ -84,6 +86,7 @@ CMD=(sbatch --account="$DELTAAI_ACCOUNT" --partition="$DELTAAI_PARTITION" --time
 case "$KIND" in
   smoke) DESC="smoke test: 2 questions x 1 sample x 3 modes" ;;
   build-slime) DESC="build the slime training image (compiles on 64 CPUs; holds 1 GPU, the billing unit)" ;;
+  diag-attn) DESC="TE attention forward/backward vs PyTorch under 3 backends, 7 shapes (job 3680134 failure) + fla kernels at real 4B shapes; report only" ;;
   slime-setup) DESC="config checks + model -> Megatron + round trip + flag check + 2-step DAPO smoke run (2 training + 2 SGLang GPUs)" ;;
   *) DESC="${JOB_ARGS[*]}" ;;
 esac
