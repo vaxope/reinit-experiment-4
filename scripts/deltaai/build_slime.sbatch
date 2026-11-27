@@ -75,6 +75,8 @@ else
 fi
 apptainer exec "$SIF" cat /opt/gar/build_info.json
 
-# ---- step 5: GPU check in the new image
-apptainer exec --nv --env CC=gcc,CXX=g++ --bind "$REPO_DIR" "$SIF" python3 scripts/deltaai/check_slime_gpu.py
+# ---- step 5: GPU check in the new image, with PyTorch's own cuDNN as every job uses it
+#      (scripts/deltaai/slime_env.sh; diagnosis job 3686686)
+apptainer exec --nv --env CC=gcc,CXX=g++ --bind "$REPO_DIR" "$SIF" \
+  bash "$REPO_DIR/scripts/deltaai/slime_env.sh" python3 scripts/deltaai/check_slime_gpu.py
 echo "[build] $(date -u +%FT%TZ) done"

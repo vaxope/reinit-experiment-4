@@ -108,6 +108,56 @@ def test_scripts_parse():
     bash = shutil.which("bash")
     # (train_reinit.sbatch, setup_and_train.sbatch and eval_trained.sbatch: not ported yet, 2026-11-24)
     for name in ("build_slime.sbatch", "submit.sh", "slime_common.sh", "slime_setup.sbatch",
-                 "train_inside.sh", "common.sh", "serve_and_generate.sh", "smoke_train.sh"):
+                 "train_inside.sh", "common.sh", "serve_and_generate.sh", "smoke_train.sh", "slime_env.sh",
+                 "diag_attention.sbatch"):
         r = subprocess.run([bash, "-n", str(REPO_ROOT / "scripts" / "deltaai" / name)], capture_output=True, text=True)
         assert r.returncode == 0, (name, r.stderr)
+
+
+# ---------------------------------------------------------------- cuDNN (diagnosis job 3686686)
+SLIME_ENV = REPO_ROOT / "scripts" / "deltaai" / "slime_env.sh"
+
+
+def _run_slime_env(pythonpath, ld="/usr/lib/x"):
+    import os
+    import sys
+    import tempfile
+    env = {"PATH": os.path.dirname(sys.executable) + ":/usr/bin:/bin", "LD_LIBRARY_PATH": ld}
+    if pythonpath:
+        env["PYTHONPATH"] = pythonpath
+    shim = tempfile.mkdtemp()   # `python3` inside slime_env.sh = this interpreter
+    (Path(shim) / "python3").symlink_to(sys.executable)
+    env["PATH"] = shim + ":" + env["PATH"]
+    return subprocess.run([shutil.which("bash"), str(SLIME_ENV), sys.executable, "-c",
+                           "import os; print(os.environ['CUDNN_HOME']); print(os.environ['LD_LIBRARY_PATH'])"],
+                          capture_output=True, text=True, env=env)
+
+
+def test_slime_env_points_cudnn_at_pytorchs_copy():
+    """CUDNN_HOME = site-packages/nvidia/cudnn, its lib/ FIRST on LD_LIBRARY_PATH, rest kept."""
+    import tempfile
+    site = tempfile.mkdtemp()
+    (Path(site) / "nvidia" / "cudnn" / "lib").mkdir(parents=True)   # namespace packages, like the pip wheel
+    r = _run_slime_env(site)
+    assert r.returncode == 0, r.stderr
+    home, ld = r.stdout.split()
+    assert Path(home) == Path(site) / "nvidia" / "cudnn"
+    assert ld.split(":")[0] == str(Path(home) / "lib") and ld.split(":")[-1] == "/usr/lib/x"
+
+
+def test_slime_env_refuses_without_pytorchs_cudnn():
+    import tempfile
+    r = _run_slime_env(tempfile.mkdtemp())
+    assert r.returncode != 0 and "nvidia.cudnn" in r.stderr
+
+
+def test_every_slime_image_gpu_command_goes_through_slime_env():
+    """S() and the build job's GPU check run slime_env.sh (the mixed-cuDNN fix)."""
+    common = (REPO_ROOT / "scripts" / "deltaai" / "slime_common.sh").read_text()
+    s_body = common[common.index("S() {"):common.index("\n}", common.index("S() {"))]
+    assert 'slime_env.sh" "$@"' in s_body
+    build = (REPO_ROOT / "scripts" / "deltaai" / "build_slime.sbatch").read_text()
+    gpu_line = build[build.index("# ---- step 5"):build.index("check_slime_gpu.py", build.index("# ---- step 5"))]
+    assert "slime_env.sh" in gpu_line
+    gpu_src = (REPO_ROOT / "scripts" / "deltaai" / "check_slime_gpu.py").read_text()
+    assert "check_cudnn):" in gpu_src   # the consistency check runs last, after TE has loaded cuDNN

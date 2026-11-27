@@ -27,6 +27,11 @@ Purpose : catch a broken GPU stack before any paid training job: the parts of th
                b. ShortConvolution (causal depthwise conv + SiLU, varlen) = torch conv1d per sequence;
                c. FusedRMSNormGated (RMSNorm * weight * SiLU(gate)) = the plain formula.
             4. torch_memory_saver imports (it is exercised for real in the first training step).
+            5. cuDNN (added 2026-11-27, diagnosis job 3686686): after TE has run, every libcudnn file
+               the process loaded comes from ONE folder, and torch's own cuDNN check passes. The
+               image has PyTorch's cuDNN 9.20 and a system 9.14; TE loads the system one first,
+               and the mix gave wrong attention gradients (check 2b, job 3680134). Jobs run with
+               scripts/deltaai/slime_env.sh, which points TE at PyTorch's copy.
 Inputs  : none (random tensors, fixed seed). No model weights, no data.
 Output  : one line per check; exit 1 if any check fails. Run INSIDE the slime image:
             apptainer exec --nv <slime.sif> python3 scripts/deltaai/check_slime_gpu.py
@@ -245,6 +250,24 @@ def check_fla_gated_norm():
                   f"rel. error {err:.1e}")
 
 
+def check_cudnn():
+    """One cuDNN in the process, and the one torch was built for (run after the TE checks)."""
+    import os
+    try:
+        with open("/proc/self/maps") as f:
+            libs = sorted({ln.split()[-1] for ln in f if "libcudnn" in ln and "/" in ln})
+    except OSError as e:
+        return report("cudnn", False, f"/proc/self/maps unreadable: {e}")
+    folders = sorted({os.path.dirname(p) for p in libs})
+    try:
+        torch_ok, torch_msg = True, f"torch sees {torch.backends.cudnn.version()}"
+    except RuntimeError as e:   # torch raises on a version mismatch
+        torch_ok, torch_msg = False, str(e).split(". ")[0]
+    return report("cudnn", len(folders) == 1 and torch_ok,
+                  f"{torch_msg}; {len(libs)} libcudnn files from {folders} "
+                  f"(CUDNN_HOME={os.environ.get('CUDNN_HOME')})")
+
+
 def check_tms():
     import torch_memory_saver  # noqa: F401
     return report("torch_memory_saver import", True)
@@ -253,7 +276,7 @@ def check_tms():
 def main():
     results = []
     for check in (check_imports, check_cuda, check_te, check_te_attention, check_fla_gated_delta_rule, check_fla_short_conv,
-                  check_fla_gated_norm, check_tms):
+                  check_fla_gated_norm, check_tms, check_cudnn):
         try:
             results.append(check())
         except Exception as e:   # report every failure, keep checking the rest

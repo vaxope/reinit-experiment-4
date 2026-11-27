@@ -17,8 +17,10 @@ SLIME_SIF="$SLIME_SIF_DIR/$(apptainer exec --bind "$REPO_DIR" "$SGLANG_SIF" pyth
 S() {
   # --nv: the GPU; CC/CXX: DeltaAI's Cray settings would break kernel builds (smoke job 3611226);
   # HF_HUB_OFFLINE: nothing is downloaded during a job (the model is in the HF cache already).
+  # slime_env.sh: PyTorch's own cuDNN for every process (diagnosis job 3686686; see that file).
   apptainer exec --nv --env "CC=gcc,CXX=g++,HF_HOME=$HF_HOME,HF_HUB_OFFLINE=1" \
-    --bind "$REPO_DIR" --bind "$HF_HOME" --bind "$SLIME_CKPT_DIR" "$SLIME_SIF" "$@"
+    --bind "$REPO_DIR" --bind "$HF_HOME" --bind "$SLIME_CKPT_DIR" "$SLIME_SIF" \
+    bash "$REPO_DIR/scripts/deltaai/slime_env.sh" "$@"
 }
 
 cfg_value() {  # cfg_value <toml file> <section> <key>
