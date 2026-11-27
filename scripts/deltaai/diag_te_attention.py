@@ -12,14 +12,24 @@ Why     : check 2b of check_slime_gpu.py failed in job 3680134: TE DotProductAtt
             - shape: head size 256 vs 128 (a pass at 128 shows the check itself is right), GQA vs
               not, ragged vs 128-aligned lengths, packed "thd" vs padded-free "bshd".
           TE's own log line ("Running with ... backend") is printed, so the backend is known.
+          cuDNN library (added after diagnosis job 3686595): that job stopped with "cuDNN version
+          incompatibility: PyTorch was compiled against (9, 20, 0) but found runtime version
+          (9, 14, 0)". TE 2.18 loads cuDNN from the system FIRST (transformer_engine/common/
+          __init__.py _load_cuda_library: $CUDNN_HOME, $CUDNN_PATH, $CUDA_HOME, $CUDA_PATH,
+          /usr/local/cuda, then LD_LIBRARY_PATH; PyTorch's pip copy only if none is found), with
+          RTLD_GLOBAL, so the whole process then runs on that older cuDNN, under kernels built for
+          another version. The "pip_cudnn" settings point TE at PyTorch's own copy (CUDNN_HOME and
+          LD_LIBRARY_PATH = site-packages/nvidia/cudnn). Every child reports which libcudnn files it
+          really loaded (/proc/self/maps), so a mix of versions is visible. Nothing crashes on the
+          version error any more (job 3686595 stopped in versions()).
           Also (default backend only): check 3's flash-linear-attention kernels at the shapes
           Qwen3.5-4B really runs (32 value heads after slime repeats the 16 key heads, head size
           128, 8,192 conv channels; config.json @ 851bf6e8) and on a longer packed batch, because
           check_slime_gpu.py tests them only at a small shape (2 heads, size 64) and the
           attention failure above depends on the shape. Uses check_slime_gpu.py's own functions.
 Inputs  : none (random tensors, fixed seed; the same reference as check_slime_gpu.py).
-Output  : one line per (backend, case) with PASS/FAIL and the rel. errors of out/dq/dk/dv, plus the
-          versions of torch, CUDA, cuDNN and TE. Changes nothing; exit code always 0 (it is a report).
+Output  : one line per (setting, case) with PASS/FAIL and the rel. errors of out/dq/dk/dv; per
+          setting the cuDNN files loaded and PyTorch's cuDNN check; package versions; cuDNN files found. Changes nothing; exit code always 0 (it is a report).
 Run     : inside the slime image, on one GPU (scripts/deltaai/submit.sh diag-attn):
             apptainer exec --nv <slime.sif> python3 scripts/deltaai/diag_te_attention.py
 """
@@ -47,12 +57,59 @@ CASES = [
 # size 128, conv channels 2 x 16 x 128 + 32 x 128 = 8,192. Small and longer packed lengths.
 FLA_HEADS, FLA_HEAD_DIM, FLA_CONV_CHANNELS = 32, 128, 8192
 FLA_SEQ_LENS = [(100, 156), (700, 1348)]
-# TE environment switches (transformer_engine/pytorch/attention/dot_product_attention/utils.py).
-BACKENDS = {
-    "default": {},
-    "cudnn_deterministic": {"NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0"},
-    "unfused": {"NVTE_FUSED_ATTN": "0", "NVTE_FLASH_ATTN": "0"},
-}
+# TE search paths for cuDNN, in its order (transformer_engine/common/__init__.py, TE 2.18).
+TE_CUDNN_VARS = ("CUDNN_HOME", "CUDNN_PATH", "CUDA_HOME", "CUDA_PATH")
+TE_CUDNN_DEFAULT_DIR = "/usr/local/cuda"
+DETERMINISTIC = {"NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0"}
+UNFUSED = {"NVTE_FUSED_ATTN": "0", "NVTE_FLASH_ATTN": "0"}
+
+
+def pip_cudnn_dir():
+    """site-packages/nvidia/cudnn (PyTorch's own cuDNN), found without importing torch."""
+    import importlib.util
+    try:
+        spec = importlib.util.find_spec("nvidia.cudnn")
+    except (ImportError, ValueError):
+        return None
+    return list(spec.submodule_search_locations)[0] if spec and spec.submodule_search_locations else None
+
+
+def settings():
+    """Environment changes to test, by name. TE reads NVTE_* and its cuDNN once per process."""
+    out = {"as_job": {}}
+    pip = pip_cudnn_dir()
+    if pip:
+        lib = os.path.join(pip, "lib")
+        pip_env = {"CUDNN_HOME": pip, "LD_LIBRARY_PATH": lib + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")}
+        out["pip_cudnn"] = pip_env
+        out["pip_cudnn_deterministic"] = {**pip_env, **DETERMINISTIC}
+    out["unfused"] = UNFUSED
+    return out
+
+
+def cudnn_files():
+    """Every libcudnn.so* TE could pick, per place it looks (recursive where TE is recursive)."""
+    import glob
+    places = [(v, os.environ.get(v)) for v in TE_CUDNN_VARS] + [("default", TE_CUDNN_DEFAULT_DIR)]
+    found = {}
+    for name, d in places:
+        if d:
+            found[f"{name}={d}"] = sorted(p for p in glob.glob(f"{d}/**/libcudnn.so*", recursive=True) if "stub" not in p)
+    for d in filter(None, os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)):
+        found[f"LD_LIBRARY_PATH {d}"] = sorted(glob.glob(f"{d}/libcudnn.so*"))
+    pip = pip_cudnn_dir()
+    if pip:
+        found[f"pip {pip}"] = sorted(glob.glob(f"{pip}/**/libcudnn.so*", recursive=True))
+    return {k: v for k, v in found.items() if v}
+
+
+def loaded_cudnn():
+    """libcudnn* files mapped into THIS process (what really runs)."""
+    try:
+        with open("/proc/self/maps") as f:
+            return sorted({ln.split()[-1] for ln in f if "libcudnn" in ln and "/" in ln})
+    except OSError as e:
+        return [f"unreadable: {e}"]
 
 
 def rel_err(a, b):
@@ -96,13 +153,20 @@ def run_case(fmt, heads, kv_heads, dim, lens):
 
 
 def child(backend):
-    """Runs every case under one backend's environment; prints one JSON line per case."""
+    """Runs every case under one setting's environment; prints one JSON line per case, then INFO."""
     for case in CASES:
         try:
             r = run_case(*case)
         except Exception as e:   # an unsupported combination is a result, not a crash
             r = {"ok": False, "errs": None, "error": f"{type(e).__name__}: {str(e)[:300]}"}
         print("RESULT " + json.dumps({"backend": backend, "case": case, **r}), flush=True)
+    info = {"cudnn_loaded": loaded_cudnn()}
+    try:
+        import torch
+        info["cudnn_torch"] = torch.backends.cudnn.version()   # raises on a version mismatch
+    except Exception as e:
+        info["cudnn_torch"] = f"{type(e).__name__}: {str(e)[:200]}"
+    print("INFO " + json.dumps(info), flush=True)
 
 
 def child_fla():
@@ -121,20 +185,16 @@ def child_fla():
 
 
 def versions():
-    import torch
-    import transformer_engine
-    v = {"torch": torch.__version__, "cuda": torch.version.cuda, "cudnn(torch)": torch.backends.cudnn.version(),
-         "transformer_engine": transformer_engine.__version__, "gpu": torch.cuda.get_device_name()}
-    try:
-        from transformer_engine.pytorch.utils import get_cudnn_version
-        v["cudnn(TE)"] = ".".join(map(str, get_cudnn_version()))
-    except Exception as e:
-        v["cudnn(TE)"] = f"unknown ({type(e).__name__})"
-    try:
-        import flash_attn  # noqa: F401
-        v["flash_attn"] = flash_attn.__version__
-    except Exception:
-        v["flash_attn"] = "not installed"
+    """Package versions WITHOUT importing torch or TE (the parent must not load any cuDNN)."""
+    from importlib import metadata
+    v = {}
+    for dist in ("torch", "transformer_engine", "transformer_engine_cu12", "nvidia-cudnn-cu12",
+                 "nvidia-cudnn-cu13", "flash_attn", "flash-linear-attention"):
+        try:
+            v[dist] = metadata.version(dist)
+        except metadata.PackageNotFoundError:
+            pass
+    v["env"] = {k: os.environ.get(k) for k in TE_CUDNN_VARS + ("LD_LIBRARY_PATH",)}
     return v
 
 
@@ -146,15 +206,19 @@ def main():
         child_fla()
         return
     print("[diag_te_attention] versions " + json.dumps(versions()), flush=True)
-    for name, extra in BACKENDS.items():
+    for place, files in cudnn_files().items():
+        print(f"[diag_te_attention] cudnn files {place}: {files}", flush=True)
+    for name, extra in settings().items():
         # NVTE_DEBUG=1, level 2 (debug): TE logs which backend it picked for each call.
         env = {**os.environ, **extra, "NVTE_DEBUG": "1", "NVTE_DEBUG_LEVEL": "2"}
         p = subprocess.run([sys.executable, __file__, "--child", name], env=env, capture_output=True, text=True)
         picked = sorted({ln.split("Running with", 1)[1].strip() for ln in (p.stdout + p.stderr).splitlines()
                          if "Running with" in ln})
-        print(f"[diag_te_attention] backend {name} {extra or ''}: TE picked {picked or 'unknown'}"
+        print(f"[diag_te_attention] setting {name} (sets {sorted(extra) or 'nothing'}): TE picked {picked or 'unknown'}"
               f"{'' if p.returncode == 0 else f' (child exit {p.returncode})'}", flush=True)
         for ln in p.stdout.splitlines():
+            if ln.startswith("INFO "):
+                print(f"[diag_te_attention]   {name}: {ln[len('INFO '):]}", flush=True)
             if ln.startswith("RESULT "):
                 r = json.loads(ln[len("RESULT "):])
                 fmt, h, kv, d, lens = r["case"]
