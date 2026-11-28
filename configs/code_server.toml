@@ -23,6 +23,9 @@ sha256 = "e867a34416e2da4a83496b09580001893e7a4e5bb58a0624c4fcd22819e7d53d"
 # it is reached only through an SSH tunnel.
 port = "8765"
 # The held node releases itself after this many minutes with no job script running in it
-# (scripts/deltaai/in_alloc.sh) | 120 | a held node is charged 4 GPU-hours per hour, idle or not; 2 h
-# leaves time to read a failure log, fix and restart, and caps a forgotten hold at 8 GPU-hours.
-idle_release_min = "120"
+# (scripts/deltaai/in_alloc.sh) | 480 | user, 2026-11-27 (was 120): editing in code-server without
+# running a job script must not release the node. 480 = submit.sh's default HOLD_TIME (8 h), so a
+# default hold is never released for idleness; a longer hold (e.g. 44 h for training) is still
+# released after 8 idle hours, which caps a forgotten hold at 32 GPU-hours (4 GPUs x 8 h).
+# Editing does not count as activity: scancel the hold when done.
+idle_release_min = "480"
