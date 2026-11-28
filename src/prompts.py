@@ -69,23 +69,27 @@ MCQ_FORMAT_INSTRUCTION = (
     'e.g., `"answer": "C"`.'
 )
 
-# Short, domain-spanning examples teach the answer format without using GPQA questions.
-# These examples are shared by Think and Default so their user prompts remain identical.
+# Short, domain-spanning examples teach both concise reasoning and the answer format
+# without using GPQA questions. They are shared by Think and Default so those modes retain
+# identical user prompts; only their assistant prefixes differ.
 FEW_SHOT_EXAMPLES = (
     "Example 1\n"
     "Question: A 2.0 kg object experiences a net force of 6.0 N. What is its acceleration?\n"
     "A) 0.33 m/s^2\nB) 3.0 m/s^2\nC) 8.0 m/s^2\nD) 12.0 m/s^2\n"
     "Example response:\n"
+    "Reasoning: a = F/m = 6.0 N / 2.0 kg = 3.0 m/s^2, so option B.\n"
     '{{"answer": "B"}}\n\n'
     "Example 2\n"
     "Question: An atom has 17 protons and 18 neutrons. What is its atomic number?\n"
     "A) 17\nB) 18\nC) 35\nD) 1\n"
     "Example response:\n"
+    "Reasoning: Atomic number equals the number of protons; 17 protons means option A.\n"
     '{{"answer": "A"}}\n\n'
     "Example 3\n"
     "Question: Which molecule carries amino acids to the ribosome during translation?\n"
     "A) mRNA\nB) rRNA\nC) DNA\nD) tRNA\n"
     "Example response:\n"
+    "Reasoning: tRNA delivers amino acids to the ribosome during translation, so option D.\n"
     '{{"answer": "D"}}\n\n'
 )
 
@@ -93,7 +97,9 @@ FEW_SHOT_EXAMPLES = (
 # their only experimental difference is the assistant prefix (thinking enabled vs disabled).
 QUESTION_PROMPT = (
     "Answer the following multiple-choice question.\n\n"
-    "Use these examples as a guide to the required final-answer format.\n\n"
+    "Briefly explain the key calculation or scientific principle in 1-2 lines before "
+    "giving your final answer. Do not respond with only a bare answer letter.\n\n"
+    "Use these examples as a guide to the expected concise reasoning and final-answer format.\n\n"
     + FEW_SHOT_EXAMPLES
     + "Now answer the following question.\n\n"
     "Question: {question}\n\n{options}\n\n"
