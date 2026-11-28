@@ -109,7 +109,8 @@ def test_scripts_parse():
     for name in ("build_slime.sbatch", "submit.sh", "slime_common.sh", "slime_setup.sbatch",
                  "train_inside.sh", "common.sh", "serve_and_generate.sh", "smoke_train.sh", "slime_env.sh",
                  "diag_attention.sbatch", "train_reinit.sbatch", "setup_and_train.sbatch", "eval_trained.sbatch",
-                 "run_control.sbatch", "smoke_test.sbatch"):
+                 "run_control.sbatch", "smoke_test.sbatch", "hold_node.sbatch", "in_alloc.sh",
+                 "install_code_server.sh"):
         r = subprocess.run([bash, "-n", str(REPO_ROOT / "scripts" / "deltaai" / name)], capture_output=True, text=True)
         assert r.returncode == 0, (name, r.stderr)
 
@@ -182,3 +183,37 @@ def test_setup_marker_is_written_once_the_round_trip_passed():
     writes = [m.start() for m in re.finditer(r'> "\$REF_DIR\.setup_pass"', s)]
     assert len(writes) == 1
     assert s.index('"$RT_STATUS" -ne 0') < writes[0] < s.index("fi   # steps 2-3") < s.index("# ---- 4")
+
+
+# ---------------------------------------------------------------- held node + code-server (2026-11-27)
+def _code_server_value(key):
+    m = re.search(rf'(?m)^{key} = "(.*)"$', (REPO_ROOT / "configs" / "code_server.toml").read_text())
+    assert m, key
+    return m.group(1)
+
+
+def test_code_server_is_pinned_and_checked():
+    """The download is one exact arm64 release whose SHA-256 is recorded; the installer refuses others."""
+    version, url, sha = _code_server_value("version"), _code_server_value("url"), _code_server_value("sha256")
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version) and re.fullmatch(r"[0-9a-f]{64}", sha)
+    assert url.endswith(f"/v{version}/code-server-{version}-linux-arm64.tar.gz")
+    assert 1024 <= int(_code_server_value("port")) < 65536
+    inst = (REPO_ROOT / "scripts" / "deltaai" / "install_code_server.sh").read_text()
+    assert inst.index('sha256sum "$TMP"') < inst.index("tar -xzf")   # checked before unpacking
+    hold = (REPO_ROOT / "scripts" / "deltaai" / "hold_node.sbatch").read_text()
+    assert '--bind-addr "127.0.0.1:$PORT"' in hold and "--auth password" in hold   # loopback + password only
+    assert 'PASSWORD="$(cat "$CS_HOME/password")"' in hold   # password via env, not on the command line
+
+
+def test_in_alloc_refuses_outside_an_allocation():
+    import os
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_")}
+    r = subprocess.run([shutil.which("bash"), str(REPO_ROOT / "scripts" / "deltaai" / "in_alloc.sh"),
+                        "scripts/deltaai/slime_setup.sbatch"], capture_output=True, text=True, env=env)
+    assert r.returncode == 1 and "not inside a Slurm allocation" in r.stdout
+
+
+def test_in_alloc_gives_each_attempt_its_own_id_and_the_allocations_end():
+    s = (REPO_ROOT / "scripts" / "deltaai" / "in_alloc.sh").read_text()
+    assert 'ATTEMPT="${ALLOC}r$(date +%m%d%H%M%S)"' in s and 'SLURM_JOB_ID="$ATTEMPT"' in s
+    assert 'SLURM_JOB_END_TIME="$END_S"' in s and "nohup setsid bash" in s

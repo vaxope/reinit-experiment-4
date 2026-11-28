@@ -13,8 +13,8 @@
 #               node, synchronous, no --colocate, no offload)             -> [hardware]
 #           Everything else keeps Experiment-3's confirmed values (user, 2026-11-24: "the same
 #           parameters from the previous experiment for everything else").
-#           Values marked PLACEHOLDER are not decided: they are there so the smoke test runs every
-#           code path, and are replaced (with a new run name) once the parameter sheet is final.
+#           DAPO, reward and overlong values: the DAPO paper's (and Experiment-3's 1 / 0 reward),
+#           DECIDED by the user on 2026-11-27 ("keep paper values"); they were placeholders before.
 # Pipeline: data/train/supergpqa_pcb_v1/{train,val}.jsonl --[src/train_prep.py]--> slime input
 #           files --[slime train.py with src/train_args.py flags, inside the slime container on
 #           DeltaAI]--> checkpoints --> converted to HF --> evaluated exactly like the control.
@@ -23,8 +23,8 @@
 # Each value: meaning | value | source | reason.
 
 [run]
-# Name of the run: output folder runs/<name>/ and the checkpoint folder name. PLACEHOLDER name
-# until the DAPO values and the prompt are final.
+# Name of the run: output folder runs/<name>/ and the checkpoint folder name. DAPO values decided
+# 2026-11-27; the name stays unless a value changes before the run starts (then a new name).
 name = "train_reinit_4b_dapo_v1"
 # Megatron's global seed | 1234 | slime default (`--seed`), as Experiment-3.
 seed = 1234
@@ -42,7 +42,8 @@ control_config = "configs/control.toml"
 # Starting model | user, 2026-11-22 | the same weights as the 4B control run.
 hf_repo = "Qwen/Qwen3.5-4B"
 # Hugging Face commit | 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a = `main` on 2026-11-24 (last
-# modified 2026-03-02) | PLACEHOLDER until the 4B control pins its revision; must equal it.
+# modified 2026-03-02) | pinned: configs/control.toml (the 4B control, 2026-11-27) pins the same
+# commit, and train_args.check_against_control refuses any difference.
 revision = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 # SHA-256 of chat_template.jinja at that revision (computed 2026-11-24). Differs from the 2B's
 # (273d8e0e...): the 4B template turns thinking ON when enable_thinking is not given, the 2B's OFF.
@@ -106,7 +107,7 @@ metadata_key = "metadata"
 # Answer rule | the control run's official rule | src/train_args.py refuses anything else.
 rule = "last_answer_field_v3"
 # Correctness reward | 1 / 0 | Experiment-3 (user, 2026-11-15). DAPO's paper uses +1 / -1; that
-# is a DAPO value still to decide (PLACEHOLDER kept at the previous experiment's 1 / 0).
+# is a DAPO value; 1 / 0 kept, DECIDED (user, 2026-11-27: keep the placeholders as final).
 correct = 1.0
 incorrect = 0.0
 
@@ -116,11 +117,11 @@ incorrect = 0.0
 #   length <= L - B        -> 0
 #   L - B < length <= L    -> penalty_factor * ((L - B) - length) / B   (0 down to -penalty_factor)
 # added to the correctness reward. A truncated answer (length = L) gets incorrect - penalty_factor.
-# mode | "soft_punish" or "none" | PLACEHOLDER (DAPO paper uses it) | decide with the parameter sheet.
+# mode | "soft_punish" or "none" | DAPO paper | DECIDED (user, 2026-11-27: keep the placeholders as final).
 mode = "soft_punish"
-# buffer_len | 4,096 tokens | PLACEHOLDER (DAPO paper: 4,096 on a 20,480 limit).
+# buffer_len | 4,096 tokens | DAPO paper (4,096 on a 20,480 limit) | DECIDED (user, 2026-11-27: keep the placeholders as final).
 buffer_len = 4096
-# penalty_factor | 1.0 | PLACEHOLDER (DAPO paper).
+# penalty_factor | 1.0 | DAPO paper | DECIDED (user, 2026-11-27: keep the placeholders as final).
 penalty_factor = 1.0
 
 [sampling]
@@ -157,22 +158,22 @@ shuffle = true
 shuffle_seed = 42
 
 [algorithm]
-# DAPO (Yu et al. 2025) | user, 2026-11-22. Every value below is a PLACEHOLDER (DAPO paper value
-# or slime's example) until the parameter sheet is final; each one maps to one slime flag
+# DAPO (Yu et al. 2025) | user, 2026-11-22. Every value below is the DAPO paper's
+# (or slime's example), DECIDED by the user on 2026-11-27 ("keep paper values"); each one maps to one slime flag
 # (slime @ 79aa41a, slime/utils/arguments.py, read 2026-11-22).
 name = "dapo"
 # Group-normalised advantage, as in GRPO and DAPO | slime `--advantage-estimator grpo`.
 advantage_estimator = "grpo"
 # Divide by the group std (DAPO keeps it) | slime's default (off = --disable-grpo-std-normalization).
 std_normalization = true
-# Clip-higher: lower and upper PPO clip | 0.2 / 0.28 | PLACEHOLDER (paper) | --eps-clip / --eps-clip-high.
+# Clip-higher: lower and upper PPO clip | 0.2 / 0.28 | paper, decided 2026-11-27 | --eps-clip / --eps-clip-high.
 eps_clip = 0.2
 eps_clip_high = 0.28
-# Token-level loss: average over all tokens in the batch | on | PLACEHOLDER (paper) |
+# Token-level loss: average over all tokens in the batch | on | paper, decided 2026-11-27 |
 # --calculate-per-token-loss.
 per_token_loss = true
 # Dynamic sampling: drop groups whose answers are all right or all wrong (DAPO: "accuracy equal to
-# 1 or 0") | on | PLACEHOLDER (paper) | --dynamic-sampling-filter-path <filter>.
+# 1 or 0") | on | paper, decided 2026-11-27 | --dynamic-sampling-filter-path <filter>.
 # Filter = OURS, on CORRECTNESS (user, 2026-11-24): src/dapo_filters.check_correctness_varies.
 # slime's check_reward_nonzero_std looks at the reward, which includes the [overlong] penalty, so
 # an all-wrong group with some long answers would be kept with a length-only signal (review
@@ -182,7 +183,7 @@ per_token_loss = true
 # starting another round when candidates run short (fewer rounds, but some no-signal groups).
 dynamic_sampling = true
 dynamic_sampling_filter = "src.dapo_filters.check_correctness_varies"
-# Questions sampled per round while filling the batch | 32 (2 x rollout_batch_size) | PLACEHOLDER |
+# Questions sampled per round while filling the batch | 32 (2 x rollout_batch_size) | decided 2026-11-27 |
 # --over-sampling-batch-size; must be >= rollout_batch_size.
 over_sampling_batch_size = 32
 # Stop the run when this many finished groups IN A ROW had no learning signal (all right or all
@@ -193,7 +194,7 @@ over_sampling_batch_size = 32
 # train.py with the reason. A healthy run cannot reach it by chance: even if 90% of groups had no
 # signal, 160 in a row has probability 0.9^160 ~ 5e-8. Must be >= over_sampling_batch_size.
 max_consecutive_dropped_groups = 160
-# KL penalty | off | PLACEHOLDER (DAPO drops it; Experiment-3 had k3 0.001) | --use-kl-loss.
+# KL penalty | off | DAPO drops it (Experiment-3 had k3 0.001); decided 2026-11-27 | --use-kl-loss.
 use_kl_loss = false
 kl_loss_type = "k3"
 kl_loss_coef = 0.0
@@ -344,6 +345,18 @@ eval_reserve_min = 150
 # Do not start training with less than this many minutes of budget | 30 | Experiment-3: less is
 # not worth the start-up (Ray + SGLang + Megatron load ~5-10 min) and one checkpoint interval.
 min_train_min = 30
+# The 4B control run inside setup_and_train.sbatch, after the smoke run and before training (user,
+# 2026-11-27: one queue wait for control + training before the Thursday deadline). Same image,
+# GPUs and control config ([run] control_config) as the trained-model evaluation. It does not
+# block training: a failed or unfinished control run is reported and resumed later with
+# `submit.sh full <control_run_id>` (generate.py resumes; nothing is lost).
+control_run_in_job = true
+# Run id of that control run | user/CLAUDE.md naming (new model + new prompts = new name).
+control_run_id = "control_4b_v1"
+# Most minutes the in-job control run may take before it is stopped (SIGTERM: generate.py saves
+# what it has; the rest resumes later) | 240 | ESTIMATE: control_v1 (2B, 1 GPU) took 54 min; the 4B on
+# 4 copies should take about as long. 240 caps the damage of a hang at 4 h of the training job.
+control_max_min = 240
 
 [smoke]
 # The smoke run (scripts/deltaai/smoke_train.sh): real slime training with THIS config, changed

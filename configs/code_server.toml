@@ -1,0 +1,28 @@
+# configs/code_server.toml: the pinned code-server release for the held-node job (scripts/deltaai/hold_node.sbatch).
+#
+# Purpose : a browser VS Code on a DeltaAI compute node, inside a long-held Slurm allocation, whose
+#           terminal runs the job scripts directly on that node (scripts/deltaai/in_alloc.sh), so a
+#           failed attempt is retried without a new queue wait (user, 2026-11-22 and 2026-11-27).
+#           DeltaAI's Open OnDemand offers only JupyterLab ("VSCode Code Server ... coming soon",
+#           user guide, read 2026-11-27), hence our own pinned copy.
+# Read by : scripts/deltaai/install_code_server.sh (login node: download + SHA-256 check) and
+#           scripts/deltaai/hold_node.sbatch (start), with sed (the login node's python3 has no
+#           tomllib), so every key below is a unique `key = "value"` line.
+# Each value: meaning | value | source | reason.
+
+# Release | 4.145.2 | github.com/coder/code-server releases, published 2026-11-07 | the newest
+# release at least two weeks old on 2026-11-27 (4.146.0 of 2026-11-20 was too new to trust).
+version = "4.145.2"
+# arm64 Linux build (DeltaAI's Grace CPUs are aarch64) | the release asset's URL
+url = "https://github.com/coder/code-server/releases/download/v4.145.2/code-server-4.145.2-linux-arm64.tar.gz"
+# SHA-256 of that file | the digest GitHub publishes for the asset (read with `gh api`, 2026-11-27) |
+# install_code_server.sh refuses any download with a different hash.
+sha256 = "e867a34416e2da4a83496b09580001893e7a4e5bb58a0624c4fcd22819e7d53d"
+# Preferred port on the compute node's loopback | 8765 | arbitrary unprivileged port; the job
+# takes the next free one if another job on the node uses it. Never bound to a network address:
+# it is reached only through an SSH tunnel.
+port = "8765"
+# The held node releases itself after this many minutes with no job script running in it
+# (scripts/deltaai/in_alloc.sh) | 120 | a held node is charged 4 GPU-hours per hour, idle or not; 2 h
+# leaves time to read a failure log, fix and restart, and caps a forgotten hold at 8 GPU-hours.
+idle_release_min = "120"

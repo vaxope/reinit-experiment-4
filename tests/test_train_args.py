@@ -382,7 +382,7 @@ def test_job_scripts_request_the_configs_gpu_count():
     def sbatch(name, opt):
         return re.findall(rf"(?m)^#SBATCH --{opt}=(\S+)$", (d / name).read_text())
 
-    for name in ("slime_setup.sbatch", "train_reinit.sbatch", "setup_and_train.sbatch"):
+    for name in ("slime_setup.sbatch", "train_reinit.sbatch", "setup_and_train.sbatch", "hold_node.sbatch"):
         assert sbatch(name, "gpus-per-node") == [str(want)], name
         for opt in ("cpus-per-task", "mem"):   # setup + training in one job: the same resources
             assert sbatch(name, opt) == sbatch("slime_setup.sbatch", opt), (name, opt)
@@ -418,8 +418,9 @@ def test_training_job_checks_flags_and_evaluates_with_the_training_control_confi
     check = train[train.rindex("\nS env", 0, cmd):cmd]
     assert f"CUDA_DEVICE_MAX_CONNECTIONS={inside.group(1)}" in check
     assert cmd < train.index("bash scripts/deltaai/train_inside.sh")   # checked before training
+    both_text = (d / "setup_and_train.sbatch").read_text()
     for key in REQUIRED["job"]:
-        assert f"job {key}" in train, key
+        assert f"job {key}" in train + both_text, key   # every [job] value is read by one of the two jobs
     # a resumed run must have the flags and data it started with (run_identity.txt), checked before training
     ident = train.index('ID_FILE="$RUN_DIR/run_identity.txt"')
     assert train.index("--out \"$FLAGS_FILE\"") < ident < train.index("bash scripts/deltaai/train_inside.sh")
@@ -432,8 +433,16 @@ def test_training_job_checks_flags_and_evaluates_with_the_training_control_confi
     ev = (d / "eval_trained.sbatch").read_text()
     assert 'cfg_value "$CFG" run control_config' in ev and "export CONTROL_CONFIG" in ev
     assert ev.index("export CONTROL_CONFIG") < ev.index("serve_and_generate.sh --run-id")
-    both = (d / "setup_and_train.sbatch").read_text()
-    assert both.index("slime_setup.sbatch") < both.index("bash scripts/deltaai/train_reinit.sbatch")
+    both = both_text
+    setup, ctl, trn = (both.index("bash scripts/deltaai/slime_setup.sbatch"),
+                       both.index("bash scripts/deltaai/serve_and_generate.sh --run-id \"$CTL_ID\""),
+                       both.index("bash scripts/deltaai/train_reinit.sbatch"))
+    assert setup < ctl < trn                      # setup + smoke, then the control run, then training
+    # the control run is capped and never stops the job (set +e around it, set -e after)
+    assert both.rindex("set +e", 0, ctl) > setup and both.index("set -e", ctl) < trn
+    assert 'timeout --signal=TERM --kill-after=120 "$((CTL_MAX_MIN * 60))"' in both
+    # the smoke run is repeated when code/config changed since the commit its marker records
+    assert 'git diff --quiet "$SMOKE_GIT" HEAD -- src configs scripts/deltaai' in both
     sub = (d / "submit.sh").read_text()
     for kind, script in (("train", "train_reinit.sbatch"), ("setup-train", "setup_and_train.sbatch"),
                          ("eval-trained", "eval_trained.sbatch")):

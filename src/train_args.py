@@ -93,7 +93,8 @@ REQUIRED = {
              "label_key", "metadata_key"],
     "reward": ["rule", "correct", "incorrect"],
     "overlong": ["mode", "buffer_len", "penalty_factor"],
-    "job": ["eval_after_training", "eval_reserve_min", "min_train_min"],
+    "job": ["eval_after_training", "eval_reserve_min", "min_train_min", "control_run_in_job",
+            "control_run_id", "control_max_min"],
     "smoke": ["steps", "force_max_len_groups", "eval_questions", "serve_questions", "serve_max_new_tokens"],
     "sampling": ["temperature", "top_p", "top_k", "min_p", "presence_penalty",
                  "repetition_penalty"],
@@ -286,8 +287,12 @@ def check_hardware(cfg: dict) -> None:
     job = cfg["job"]
     if not isinstance(job["eval_after_training"], bool):
         raise ValueError("[job] eval_after_training must be true or false")
-    if job["eval_reserve_min"] <= 0 or job["min_train_min"] <= 0:
-        raise ValueError("[job] eval_reserve_min and min_train_min must be positive minutes")
+    if job["eval_reserve_min"] <= 0 or job["min_train_min"] <= 0 or job["control_max_min"] <= 0:
+        raise ValueError("[job] eval_reserve_min, min_train_min and control_max_min must be positive minutes")
+    if not isinstance(job["control_run_in_job"], bool):
+        raise ValueError("[job] control_run_in_job must be true or false")
+    if not str(job["control_run_id"]).startswith("control_"):
+        raise ValueError("[job] control_run_id must start with 'control_' (generate.py's strict checks apply to it)")
     disk = disk_estimate_gb(cfg)
     if disk > cfg["checkpoint"]["disk_budget_gb"]:
         raise ValueError(f"[checkpoint] about {disk:.0f} GB of saves exceed disk_budget_gb "

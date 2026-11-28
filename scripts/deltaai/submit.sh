@@ -10,12 +10,15 @@
 #         scripts/deltaai/submit.sh diag-attn        [--dry-run]   (TE attention-gradient diagnosis, 1 GPU, report only)
 #         scripts/deltaai/submit.sh train            [--dry-run]   (the long DAPO run, then the GPQA evaluation of
 #                                                                     its best checkpoint; needs both setup markers; 4 GPUs)
-#         scripts/deltaai/submit.sh setup-train      [--dry-run]   (slime-setup, unless the smoke run passed, then
-#                                                                     train, in one job = one queue wait; 4 GPUs)
+#         scripts/deltaai/submit.sh setup-train      [--dry-run]   (slime-setup + smoke unless passed at this code, the
+#                                                                     4B control run, then train, in one job = one queue wait; 4 GPUs)
+#         scripts/deltaai/submit.sh hold [SCRIPT [ARGS]] [--dry-run]   (hold a 4-GPU node with code-server; SCRIPT
+#                                                                     starts on arrival; retries run inside it without queueing:
+#                                                                     in_alloc.sh; charged while held; released when idle)
 #         scripts/deltaai/submit.sh eval-trained [STEP|best] [--dry-run]   (convert, check and evaluate one saved
 #                                                                     checkpoint like the control run; 4 GPUs)
-# Time limits (env.sh may override): train / setup-train 24 h = 96 GPU-hours at most (ghx4 allows
-# 48 h; resubmitting resumes from the last save), eval-trained 4 h. See the DESC lines below.
+# Time limits (env.sh may override): train 24 h = 96 GPU-hours at most, setup-train 30 h = 120 (ghx4
+# allows 48 h; resubmitting resumes from the last save), eval-trained 4 h. See the DESC lines below.
 #
 # It reads scripts/deltaai/env.sh (account, partition, time limits), prints exactly what will
 # be requested (GPUs, read from the job script's #SBATCH --gpus-per-node line; time limit; the
@@ -49,10 +52,14 @@ case "$KIND" in
   # 24 h (user, 2026-11-27: "what is most reasonable"): 100 steps at an unmeasured step time; the
   # smoke run's step times give the real estimate. A run that needs longer resumes when resubmitted.
   train) TIME="${TRAIN_TIME:-24:00:00}"; SCRIPT=scripts/deltaai/train_reinit.sbatch; JOB_ARGS=() ;;
-  setup-train) TIME="${SETUP_TRAIN_TIME:-24:00:00}"; SCRIPT=scripts/deltaai/setup_and_train.sbatch; JOB_ARGS=() ;;
+  # 30 h = the 24 h of `train` + setup/smoke (~1-2 h) + the in-job control run (~1-2 h) + margin;
+  # train_reinit.sbatch's budget is computed from the job's end, so training gets what is left.
+  setup-train) TIME="${SETUP_TRAIN_TIME:-30:00:00}"; SCRIPT=scripts/deltaai/setup_and_train.sbatch; JOB_ARGS=() ;;
   # 4 h: conversion + GPQA (control_v1: 54 min for the 2B on 1 GPU) with margin; resubmitting resumes
   eval-trained) TIME="${EVAL_TRAINED_TIME:-04:00:00}"; SCRIPT=scripts/deltaai/eval_trained.sbatch; JOB_ARGS=("${2:-best}") ;;
-  *) echo "usage: $0 smoke|pilot [RUN_ID]|full [RUN_ID]|build-slime|slime-setup|diag-attn|train|setup-train|eval-trained [STEP|best] [--dry-run]"; exit 2 ;;
+  # A held node is charged while idle: 8 h (32 GPU-hours at most) unless HOLD_TIME says otherwise; scancel early.
+  hold) TIME="${HOLD_TIME:-08:00:00}"; SCRIPT=scripts/deltaai/hold_node.sbatch; JOB_ARGS=("${@:2}") ;;
+  *) echo "usage: $0 smoke|pilot [RUN_ID]|full [RUN_ID]|build-slime|slime-setup|diag-attn|train|setup-train|eval-trained [STEP|best]|hold [--dry-run]"; exit 2 ;;
 esac
 for v in DELTAAI_ACCOUNT DELTAAI_PARTITION; do
   case "${!v:-}" in ""|"<"*) echo "$v is not set in scripts/deltaai/env.sh"; exit 1 ;; esac
@@ -88,7 +95,16 @@ preflight_slime() {
 }
 case "$KIND" in
   slime-setup|train|setup-train|eval-trained) preflight_slime || { echo "Preflight failed: not submitted."; exit 1; } ;;
+  hold) if [ "${#JOB_ARGS[@]}" -gt 0 ]; then preflight_slime || { echo "Preflight failed: not submitted."; exit 1; }; fi ;;
 esac
+if [ "$KIND" = hold ]; then
+  v="$(sed -n 's/^version = "\(.*\)"$/\1/p' configs/code_server.toml)"
+  if [ -x "${CODE_SERVER_HOME:-$HOME/.gar_code_server}/code-server-$v-linux-arm64/bin/code-server" ]; then
+    echo "preflight: ok      code-server $v"
+  else
+    echo "preflight: code-server $v not installed (bash scripts/deltaai/install_code_server.sh); the node is held without it"
+  fi
+fi
 # `train` needs both markers of the setup job (setup_pass: Megatron copy verified; smoke_pass: the
 # 2-step smoke run passed); the job checks them too, but only after the queue wait.
 if [ "$KIND" = train ]; then
@@ -101,8 +117,9 @@ if [ "$KIND" = train ]; then
 fi
 # The jobs that train or evaluate refuse an uncommitted tree inside the job, i.e. after the queue
 # wait; refuse it here already.
-case "$KIND" in
-  train|setup-train|eval-trained)
+HOLD_RUNS=0; if [ "$KIND" = hold ] && [ "${#JOB_ARGS[@]}" -gt 0 ]; then HOLD_RUNS=1; fi
+case "$KIND$HOLD_RUNS" in
+  train0|setup-train0|eval-trained0|hold1)
     if [ -n "$(git status --porcelain -- src configs scripts)" ]; then
       echo "Uncommitted changes in src/, configs/ or scripts/ (the job would refuse them): commit first. Not submitted."; exit 1
     fi ;;
@@ -123,7 +140,8 @@ case "$KIND" in
   diag-attn) DESC="TE attention forward/backward vs PyTorch under 3 backends, 7 shapes (job 3680134 failure) + fla kernels at real 4B shapes; report only" ;;
   slime-setup) DESC="config checks + model -> Megatron + round trip + flag check + 2-step DAPO smoke run (2 training + 2 SGLang GPUs)" ;;
   train) DESC="DAPO training (2 training + 2 SGLang GPUs) until the evaluation reserve, then GPQA evaluation of the best checkpoint (4 model copies)" ;;
-  setup-train) DESC="slime-setup (skipped if the smoke run passed) + train, one queue wait" ;;
+  setup-train) DESC="slime-setup + smoke (skipped if passed at this code) + the 4B control run ([job] control_run_id) + train + evaluation, one queue wait" ;;
+  hold) DESC="hold a 4-GPU node with code-server; on arrival run: ${JOB_ARGS[*]:-nothing}; retries inside it with in_alloc.sh. CHARGED WHILE HELD (released after success or when idle)" ;;
   eval-trained) DESC="convert + check + GPQA evaluation (198 x 4 x 3 modes, control settings) of checkpoint '${JOB_ARGS[0]}'" ;;
   *) DESC="${JOB_ARGS[*]}" ;;
 esac
