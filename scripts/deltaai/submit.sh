@@ -2,13 +2,20 @@
 # scripts/deltaai/submit.sh: the ONE way to submit DeltaAI jobs, control and training (run on a login node).
 #
 # Usage:  scripts/deltaai/submit.sh smoke            [--dry-run]
-#         scripts/deltaai/submit.sh pilot [RUN_ID]   [--dry-run]   (default RUN_ID pilot_v1)
-#         scripts/deltaai/submit.sh full  [RUN_ID]   [--dry-run]   (default RUN_ID control_v1)
+#         scripts/deltaai/submit.sh pilot [RUN_ID]   [--dry-run]   (default RUN_ID pilot_4b_v1)
+#         scripts/deltaai/submit.sh full  [RUN_ID]   [--dry-run]   (default RUN_ID control_4b_v1)
 #         scripts/deltaai/submit.sh build-slime      [--dry-run]   (slime training image, build_slime.sbatch)
 #         scripts/deltaai/submit.sh slime-setup      [--dry-run]   (config checks, weights -> Megatron + round
 #                                                                     trip, flag check, 2-step DAPO smoke run; 4 GPUs)
 #         scripts/deltaai/submit.sh diag-attn        [--dry-run]   (TE attention-gradient diagnosis, 1 GPU, report only)
-# (The long training run and the trained-model evaluation jobs are not ported yet.)
+#         scripts/deltaai/submit.sh train            [--dry-run]   (the long DAPO run, then the GPQA evaluation of
+#                                                                     its best checkpoint; needs both setup markers; 4 GPUs)
+#         scripts/deltaai/submit.sh setup-train      [--dry-run]   (slime-setup, unless the smoke run passed, then
+#                                                                     train, in one job = one queue wait; 4 GPUs)
+#         scripts/deltaai/submit.sh eval-trained [STEP|best] [--dry-run]   (convert, check and evaluate one saved
+#                                                                     checkpoint like the control run; 4 GPUs)
+# Time limits (env.sh may override): train / setup-train 24 h = 96 GPU-hours at most (ghx4 allows
+# 48 h; resubmitting resumes from the last save), eval-trained 4 h. See the DESC lines below.
 #
 # It reads scripts/deltaai/env.sh (account, partition, time limits), prints exactly what will
 # be requested (GPUs, read from the job script's #SBATCH --gpus-per-node line; time limit; the
@@ -31,12 +38,21 @@ KIND="${1:-}"
 
 case "$KIND" in
   smoke) TIME="${SMOKE_TIME:-00:30:00}"; SCRIPT=scripts/deltaai/smoke_test.sbatch; JOB_ARGS=() ;;
-  pilot) TIME="${PILOT_TIME:-02:00:00}"; SCRIPT=scripts/deltaai/run_control.sbatch; JOB_ARGS=(--run-id "${2:-pilot_v1}" --pilot) ;;
-  full)  TIME="${FULL_TIME:-24:00:00}";  SCRIPT=scripts/deltaai/run_control.sbatch; JOB_ARGS=(--run-id "${2:-control_v1}") ;;
+  # Default run ids: the 4B control (configs/control.toml since 2026-11-27); control_v1/pilot_v1 are
+  # the finished 2B runs, which generate.py would refuse to resume with another config anyway.
+  # full: 06:00:00 as env.example.sh (control_v1 took 54 min on 1 GPU; now [server] dp_size GPUs).
+  pilot) TIME="${PILOT_TIME:-02:00:00}"; SCRIPT=scripts/deltaai/run_control.sbatch; JOB_ARGS=(--run-id "${2:-pilot_4b_v1}" --pilot) ;;
+  full)  TIME="${FULL_TIME:-06:00:00}";  SCRIPT=scripts/deltaai/run_control.sbatch; JOB_ARGS=(--run-id "${2:-control_4b_v1}") ;;
   build-slime) TIME="${BUILD_SLIME_TIME:-03:30:00}"; SCRIPT=scripts/deltaai/build_slime.sbatch; JOB_ARGS=() ;;
   slime-setup) TIME="${SLIME_SETUP_TIME:-03:00:00}"; SCRIPT=scripts/deltaai/slime_setup.sbatch; JOB_ARGS=() ;;
   diag-attn) TIME="${DIAG_ATTN_TIME:-00:20:00}"; SCRIPT=scripts/deltaai/diag_attention.sbatch; JOB_ARGS=() ;;
-  *) echo "usage: $0 smoke|pilot [RUN_ID]|full [RUN_ID]|build-slime|slime-setup|diag-attn [--dry-run]"; exit 2 ;;
+  # 24 h (user, 2026-11-27: "what is most reasonable"): 100 steps at an unmeasured step time; the
+  # smoke run's step times give the real estimate. A run that needs longer resumes when resubmitted.
+  train) TIME="${TRAIN_TIME:-24:00:00}"; SCRIPT=scripts/deltaai/train_reinit.sbatch; JOB_ARGS=() ;;
+  setup-train) TIME="${SETUP_TRAIN_TIME:-24:00:00}"; SCRIPT=scripts/deltaai/setup_and_train.sbatch; JOB_ARGS=() ;;
+  # 4 h: conversion + GPQA (control_v1: 54 min for the 2B on 1 GPU) with margin; resubmitting resumes
+  eval-trained) TIME="${EVAL_TRAINED_TIME:-04:00:00}"; SCRIPT=scripts/deltaai/eval_trained.sbatch; JOB_ARGS=("${2:-best}") ;;
+  *) echo "usage: $0 smoke|pilot [RUN_ID]|full [RUN_ID]|build-slime|slime-setup|diag-attn|train|setup-train|eval-trained [STEP|best] [--dry-run]"; exit 2 ;;
 esac
 for v in DELTAAI_ACCOUNT DELTAAI_PARTITION; do
   case "${!v:-}" in ""|"<"*) echo "$v is not set in scripts/deltaai/env.sh"; exit 1 ;; esac
@@ -70,9 +86,27 @@ preflight_slime() {
   echo "preflight: free space where checkpoints go (the project quota is what counts: \`quota\`):"
   df -h "$SLIME_CKPT_DIR" 2>/dev/null | tail -n 1 || true
 }
-if [ "$KIND" = slime-setup ]; then
-  preflight_slime || { echo "Preflight failed: not submitted."; exit 1; }
+case "$KIND" in
+  slime-setup|train|setup-train|eval-trained) preflight_slime || { echo "Preflight failed: not submitted."; exit 1; } ;;
+esac
+# `train` needs both markers of the setup job (setup_pass: Megatron copy verified; smoke_pass: the
+# 2-step smoke run passed); the job checks them too, but only after the queue wait.
+if [ "$KIND" = train ]; then
+  repo="$(toml_get hf_repo)"; rev="$(toml_get revision)"
+  ref="$SLIME_CKPT_DIR/${repo##*/}_${rev:0:8}_torch_dist"
+  for m in setup_pass smoke_pass; do
+    if [ -f "$ref.$m" ]; then echo "preflight: ok      $ref.$m ($(cat "$ref.$m"))"
+    else echo "preflight: MISSING $ref.$m: run submit.sh slime-setup (or submit.sh setup-train). Not submitted."; exit 1; fi
+  done
 fi
+# The jobs that train or evaluate refuse an uncommitted tree inside the job, i.e. after the queue
+# wait; refuse it here already.
+case "$KIND" in
+  train|setup-train|eval-trained)
+    if [ -n "$(git status --porcelain -- src configs scripts)" ]; then
+      echo "Uncommitted changes in src/, configs/ or scripts/ (the job would refuse them): commit first. Not submitted."; exit 1
+    fi ;;
+esac
 
 # GPUs the job asks for: its own #SBATCH --gpus-per-node line (the training jobs take a whole node).
 GPUS=$(grep -m1 -oE '^#SBATCH --gpus-per-node=[0-9]+' "$SCRIPT" | cut -d= -f2 || true)   # || true: keep our message under pipefail
@@ -88,6 +122,9 @@ case "$KIND" in
   build-slime) DESC="build the slime training image (compiles on 64 CPUs; holds 1 GPU, the billing unit)" ;;
   diag-attn) DESC="TE attention forward/backward vs PyTorch under 3 backends, 7 shapes (job 3680134 failure) + fla kernels at real 4B shapes; report only" ;;
   slime-setup) DESC="config checks + model -> Megatron + round trip + flag check + 2-step DAPO smoke run (2 training + 2 SGLang GPUs)" ;;
+  train) DESC="DAPO training (2 training + 2 SGLang GPUs) until the evaluation reserve, then GPQA evaluation of the best checkpoint (4 model copies)" ;;
+  setup-train) DESC="slime-setup (skipped if the smoke run passed) + train, one queue wait" ;;
+  eval-trained) DESC="convert + check + GPQA evaluation (198 x 4 x 3 modes, control settings) of checkpoint '${JOB_ARGS[0]}'" ;;
   *) DESC="${JOB_ARGS[*]}" ;;
 esac
 echo "Job:       $KIND ($DESC)"

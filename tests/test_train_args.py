@@ -8,9 +8,9 @@ should:
   - separate GPUs (user, 2026-11-22): 2 training + 2 SGLang on one node, never --colocate or offload;
   - Qwen3.5-4B architecture vs its config.json (values fetched 2026-11-24);
   - sampling / reward / model differing from the control config.
-The 4B control config (configs/control_4b.toml) does not exist yet, so the control-match tests use
-a stand-in: configs/control.toml with ONLY its [model] replaced by the training config's model.
-No slime, GPU or network needed.
+The control-match tests use the real 4B control config (configs/control.toml, 2026-11-27) and, to
+prove the model check refuses a mismatch, a 2B stand-in: that config with ONLY [model] set back to
+the 2B of control_v1. No slime, GPU or network needed.
 """
 import copy
 import json
@@ -20,13 +20,13 @@ from pathlib import Path
 
 from src import train_args
 from src.config import REPO_ROOT, load_config
-from src.train_args import (FORBIDDEN_FLAGS, HF_CONFIG_KEYS, PARSED_NAME, _flag_value, build_args,
+from src.train_args import (REQUIRED, FORBIDDEN_FLAGS, HF_CONFIG_KEYS, PARSED_NAME, _flag_value, build_args,
                             check_against_control, check_algorithm, check_all, check_flags, check_hardware,
                             check_hf_config, disk_estimate_gb, expected_resolved, load_control_for,
                             load_train_config, main, memory_estimate_gb, model_args, smoke_config)
 
 CFG = load_train_config()
-CONTROL_2B = load_config()
+CONTROL = load_config()
 PATHS = dict(hf_checkpoint="HF", ref_load="REF", save="SAVE", prompt_data="P.jsonl", eval_data="E.jsonl")
 
 # Qwen3.5-4B @ 851bf6e8, config.json text_config (fetched 2026-11-24): the numbers the config must hold.
@@ -36,15 +36,15 @@ QWEN35_4B = {"num_hidden_layers": 32, "hidden_size": 2560, "intermediate_size": 
              "max_position_embeddings": 262144}
 
 
-def control_4b_stand_in() -> dict:
-    """configs/control.toml with only [model] swapped to the training model (see the module doc)."""
-    c = copy.deepcopy(CONTROL_2B)
-    c["model"].update(name=CFG["model"]["hf_repo"], revision=CFG["model"]["revision"],
-                      chat_template_sha256=CFG["model"]["chat_template_sha256"])
+def control_2b_stand_in() -> dict:
+    """configs/control.toml with only [model] set to control_v1's 2B (see the module doc)."""
+    c = copy.deepcopy(CONTROL)
+    c["model"].update(name="Qwen/Qwen3.5-2B", revision="15852e8c16360a2fea060d615a32b45270f8a8fc",
+                      chat_template_sha256="273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80")
     return c
 
 
-CONTROL = control_4b_stand_in()
+CONTROL_2B = control_2b_stand_in()
 
 
 def value(flags, flag):
@@ -80,7 +80,7 @@ def test_training_targets_qwen35_4b_and_refuses_the_2b_control():
 
 def test_missing_control_config_is_refused_with_a_clear_message():
     """[run] control_config names the 4B control; if it is missing, nothing can be built.
-    Tested with a path that never exists, so the test runs whether or not configs/control_4b.toml does."""
+    Tested with a path that never exists."""
     missing = str(Path(tempfile.mkdtemp()) / "control_missing.toml")
     try:
         load_control_for(CFG, missing)
@@ -99,7 +99,7 @@ def test_missing_control_config_is_refused_with_a_clear_message():
 def test_check_mode_passes_with_a_matching_control_and_config_json():
     d = Path(tempfile.mkdtemp())
     (d / "config.json").write_text(json.dumps({"text_config": QWEN35_4B}))
-    ctl = d / "control_4b.toml"
+    ctl = d / "control_copy.toml"
     src = (REPO_ROOT / "configs" / "control.toml").read_text()
     for key, new in (("name", CFG["model"]["hf_repo"]), ("revision", CFG["model"]["revision"]),
                      ("chat_template_sha256", CFG["model"]["chat_template_sha256"])):
@@ -377,11 +377,68 @@ def test_job_scripts_request_the_configs_gpu_count():
     """Slurm reads #SBATCH lines before any code runs, so the number is written in the script;
     it must equal [hardware] gpus_per_node (submit.sh reads the same line for the cost)."""
     want = CFG["hardware"]["gpus_per_node"]
-    text = (REPO_ROOT / "scripts" / "deltaai" / "slime_setup.sbatch").read_text()
-    got = re.findall(r"(?m)^#SBATCH --gpus-per-node=(\d+)$", text)
-    assert got == [str(want)], got
-    smoke = (REPO_ROOT / "scripts" / "deltaai" / "smoke_train.sh").read_text()
-    assert 'cfg_value "$CFG" hardware gpus_per_node' in smoke    # Ray gets the same number
+    d = REPO_ROOT / "scripts" / "deltaai"
+
+    def sbatch(name, opt):
+        return re.findall(rf"(?m)^#SBATCH --{opt}=(\S+)$", (d / name).read_text())
+
+    for name in ("slime_setup.sbatch", "train_reinit.sbatch", "setup_and_train.sbatch"):
+        assert sbatch(name, "gpus-per-node") == [str(want)], name
+        for opt in ("cpus-per-task", "mem"):   # setup + training in one job: the same resources
+            assert sbatch(name, opt) == sbatch("slime_setup.sbatch", opt), (name, opt)
+    for name in ("smoke_train.sh", "train_reinit.sbatch"):
+        assert 'cfg_value "$CFG" hardware gpus_per_node' in (d / name).read_text(), name   # Ray gets the same number
+
+
+def test_jobs_that_serve_the_control_model_request_dp_size_gpus():
+    """SGLang starts [server] dp_size model copies, one per GPU (user, 2026-11-27): the control jobs and
+    the standalone evaluation request exactly that many GPUs; the training node must hold them, since
+    the evaluation also runs inside the training job (train_args.check_against_control)."""
+    dp = CONTROL["server"]["dp_size"]
+    d = REPO_ROOT / "scripts" / "deltaai"
+    for name in ("run_control.sbatch", "smoke_test.sbatch", "eval_trained.sbatch"):
+        got = re.findall(r"(?m)^#SBATCH --gpus-per-node=(\d+)$", (d / name).read_text())
+        assert got == [str(dp)], (name, got)
+    assert '--dp-size "$DP_SIZE"' in (d / "serve_and_generate.sh").read_text()
+    assert raises(check_against_control, CFG, dict(CONTROL, server=dict(CONTROL["server"], dp_size=want_too_many())))
+
+
+def want_too_many():
+    return CFG["hardware"]["gpus_per_node"] + 1
+
+
+def test_training_job_checks_flags_and_evaluates_with_the_training_control_config():
+    """train_reinit.sbatch: slime's parser on this job's flags with training's CUDA_DEVICE_MAX_CONNECTIONS
+    (setup_pass no longer implies the flag check), the time budget from [job], and the evaluation
+    with the control config of [run] control_config (not the default file)."""
+    d = REPO_ROOT / "scripts" / "deltaai"
+    train = (d / "train_reinit.sbatch").read_text()
+    inside = re.search(r"(?m)^export .*CUDA_DEVICE_MAX_CONNECTIONS=(\S+)", (d / "train_inside.sh").read_text())
+    cmd = train.index("python3 scripts/deltaai/check_slime_args.py")   # the command, not the header
+    check = train[train.rindex("\nS env", 0, cmd):cmd]
+    assert f"CUDA_DEVICE_MAX_CONNECTIONS={inside.group(1)}" in check
+    assert cmd < train.index("bash scripts/deltaai/train_inside.sh")   # checked before training
+    for key in REQUIRED["job"]:
+        assert f"job {key}" in train, key
+    # a resumed run must have the flags and data it started with (run_identity.txt), checked before training
+    ident = train.index('ID_FILE="$RUN_DIR/run_identity.txt"')
+    assert train.index("--out \"$FLAGS_FILE\"") < ident < train.index("bash scripts/deltaai/train_inside.sh")
+    assert 'sha256sum "$DATA_DIR/manifest.json"' in train
+    # submit.sh's marker preflight builds the same folder name as slime_paths (<model>_<rev 8>_torch_dist)
+    common = (d / "slime_common.sh").read_text()
+    assert 'REF_DIR="$SLIME_CKPT_DIR/$(basename "$repo")_${rev:0:8}_torch_dist"' in common
+    assert 'ref="$SLIME_CKPT_DIR/${repo##*/}_${rev:0:8}_torch_dist"' in (d / "submit.sh").read_text()
+    assert train.rstrip().endswith("bash scripts/deltaai/eval_trained.sbatch best")
+    ev = (d / "eval_trained.sbatch").read_text()
+    assert 'cfg_value "$CFG" run control_config' in ev and "export CONTROL_CONFIG" in ev
+    assert ev.index("export CONTROL_CONFIG") < ev.index("serve_and_generate.sh --run-id")
+    both = (d / "setup_and_train.sbatch").read_text()
+    assert both.index("slime_setup.sbatch") < both.index("bash scripts/deltaai/train_reinit.sbatch")
+    sub = (d / "submit.sh").read_text()
+    for kind, script in (("train", "train_reinit.sbatch"), ("setup-train", "setup_and_train.sbatch"),
+                         ("eval-trained", "eval_trained.sbatch")):
+        assert re.search(rf"(?m)^  {kind}\) .*SCRIPT=scripts/deltaai/{script};", sub), kind
+        assert (d / script).exists()
 
 
 # ---------------------------------------------------------------- unchanged machinery

@@ -2,7 +2,8 @@
 # scripts/deltaai/smoke_test.sbatch: short end-to-end test of the whole DeltaAI pipeline.
 #
 # Submit through submit.sh:   scripts/deltaai/submit.sh smoke
-# What it does, on 1 GPU, in a few minutes:
+# What it does, in a few minutes, on [server] dp_size GPUs (4: served exactly like the real runs;
+# tests/test_slime_container.py checks the #SBATCH line against the config):
 #   1. starts SGLang and runs src/generate.py on 2 questions x 1 sample x 3 modes, with the
 #      output capped at SMOKE_MAX_NEW_TOKENS (default 4096) so it finishes fast. The cap is a
 #      test-only override; the run id starts with "smoke_" so it can never be mistaken for, or
@@ -14,9 +15,9 @@
 #SBATCH --job-name=gar-smoke
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=240G
 #SBATCH --output=runs/_slurm/%x_%j.out
 # The job reads and writes /projects (repo, runs, HF cache, container). NCSA asks jobs to
 # declare that, so they can be held or handled if /projects has problems (DeltaAI user guide,

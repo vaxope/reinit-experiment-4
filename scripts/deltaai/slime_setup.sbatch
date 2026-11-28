@@ -48,7 +48,8 @@
 # memory ([hardware] optimizer_cpu_offload): ~2.6B params x 16 bytes (fp32 master + Adam + grad
 # copy) ~ 42 GB per training GPU, ~84 GB for both, plus pinned buffers. 240G = that with margin,
 # kept well under a GH200 node's total (4 x 120 GB LPDDR) so the request cannot exceed the node.
-# UNVERIFIED against DeltaAI's per-node limits: `sinfo -p ghx4 -o "%n %c %m"` before submitting.
+# Accepted by Slurm on ghx4 (setup jobs 3680134 and 3686748 were scheduled with it; the node
+# reported 476 GB host memory). Peak use during training is still unmeasured.
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=240G
 #SBATCH --output=runs/_slurm/%x_%j.out

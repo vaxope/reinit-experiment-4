@@ -186,7 +186,9 @@ def _snapshot():
         return None
     from huggingface_hub import snapshot_download
     try:
-        return Path(snapshot_download("Qwen/Qwen3.5-2B", revision="15852e8c16360a2fea060d615a32b45270f8a8fc",
+        from src.config import load_config
+        model = load_config()["model"]   # the control model (4B since 2026-11-27), so its template hash matches
+        return Path(snapshot_download(model["name"], revision=model["revision"],
                                       local_files_only=True, allow_patterns=["*.json", "*.jinja", "*.txt"]))
     except Exception:
         return None

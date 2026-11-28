@@ -93,6 +93,7 @@ REQUIRED = {
              "label_key", "metadata_key"],
     "reward": ["rule", "correct", "incorrect"],
     "overlong": ["mode", "buffer_len", "penalty_factor"],
+    "job": ["eval_after_training", "eval_reserve_min", "min_train_min"],
     "smoke": ["steps", "force_max_len_groups", "eval_questions", "serve_questions", "serve_max_new_tokens"],
     "sampling": ["temperature", "top_p", "top_k", "min_p", "presence_penalty",
                  "repetition_penalty"],
@@ -157,6 +158,10 @@ def check_against_control(cfg: dict, control: dict) -> None:
     if cfg["model"]["hf_repo"] != control["model"]["name"]:
         raise ValueError(f"[model] hf_repo {cfg['model']['hf_repo']!r} differs from the control config's "
                          f"[model] name {control['model']['name']!r}")
+    # the GPQA evaluation runs inside the training job (train_reinit.sbatch), on this node's GPUs
+    if control["server"]["dp_size"] > cfg["hardware"]["gpus_per_node"]:
+        raise ValueError(f"control [server] dp_size {control['server']['dp_size']} > [hardware] gpus_per_node "
+                         f"{cfg['hardware']['gpus_per_node']}: the in-job evaluation could not start")
     # the same attention kernels as the control run / GPQA evaluation (smoke job 3633318)
     for key in ("attention_backend", "mm_attention_backend"):
         if cfg["hardware"]["sglang_" + key] != control["server"][key]:
@@ -278,6 +283,11 @@ def check_hardware(cfg: dict) -> None:
         raise ValueError(f"[hardware] estimated {mem['total']:.0f} GB per training GPU (model state {mem['model_state']:.0f}"
                          f" + logits {mem['logits']:.0f} + activations {mem['activations']:.0f}) exceeds "
                          f"{mem['limit']:.0f} GB: raise tensor parallel, offload the optimizer or shorten the sequences")
+    job = cfg["job"]
+    if not isinstance(job["eval_after_training"], bool):
+        raise ValueError("[job] eval_after_training must be true or false")
+    if job["eval_reserve_min"] <= 0 or job["min_train_min"] <= 0:
+        raise ValueError("[job] eval_reserve_min and min_train_min must be positive minutes")
     disk = disk_estimate_gb(cfg)
     if disk > cfg["checkpoint"]["disk_budget_gb"]:
         raise ValueError(f"[checkpoint] about {disk:.0f} GB of saves exceed disk_budget_gb "

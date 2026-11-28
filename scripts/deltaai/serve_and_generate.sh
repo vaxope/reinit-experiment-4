@@ -41,12 +41,12 @@ if [ -n "${EVAL_MODEL_DIR:-}" ]; then
 else
   MODEL_ARGS=(--model-path "$MODEL" --revision "$REVISION"); MODEL_DESC="$MODEL @ $REVISION"
 fi
-echo "[serve] starting $SERVER_MODULE: $MODEL_DESC ($DTYPE, attention backend $ATTN_BACKEND, vision $MM_ATTN_BACKEND) on $HOST:$PORT, log $SERVER_LOG"
+echo "[serve] starting $SERVER_MODULE: $MODEL_DESC ($DTYPE, attention backend $ATTN_BACKEND, vision $MM_ATTN_BACKEND, $DP_SIZE data-parallel copies) on $HOST:$PORT, log $SERVER_LOG"
 # SERVER_EXTRA_ARGS: optional extra SGLang flags (e.g. --mem-fraction-static 0.85); unquoted
 # on purpose so it splits into separate arguments. run_exec makes $! the server's own pid.
 # shellcheck disable=SC2086
 run_exec "$PYTHON" -m "$SERVER_MODULE" "${MODEL_ARGS[@]}" --dtype "$DTYPE" \
-    --host "$HOST" --port "$PORT" --random-seed "$SEED" --attention-backend "$ATTN_BACKEND" --mm-attention-backend "$MM_ATTN_BACKEND" ${SERVER_EXTRA_ARGS:-} \
+    --host "$HOST" --port "$PORT" --random-seed "$SEED" --attention-backend "$ATTN_BACKEND" --mm-attention-backend "$MM_ATTN_BACKEND" --dp-size "$DP_SIZE" ${SERVER_EXTRA_ARGS:-} \
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 

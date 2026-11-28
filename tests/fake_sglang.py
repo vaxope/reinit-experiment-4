@@ -73,7 +73,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"version": a.fake_version, "model_path": a.model_path, "revision": a.revision,
                                     "dtype": a.dtype, "random_seed": a.random_seed,
                                     "attention_backend": a.attention_backend,
-                                    "mm_attention_backend": a.mm_attention_backend})
+                                    "mm_attention_backend": a.mm_attention_backend, "dp_size": a.dp_size})
         if self.path == "/get_model_info":
             return self._send(200, {"model_path": a.model_path, "is_generation": True})
         return self._send(404, {"error": f"no route {self.path}"})
@@ -120,6 +120,7 @@ def main(argv=None):
     ap.add_argument("--random-seed", type=int, default=0)
     ap.add_argument("--attention-backend", default=None)  # reported back, like real SGLang
     ap.add_argument("--mm-attention-backend", default=None)
+    ap.add_argument("--dp-size", type=int, default=1)       # reported back, like real SGLang
     ap.add_argument("--fake-version", default="fake-sglang", help="version to report (e.g. the pinned one)")
     ap.add_argument("--fake-error-every", type=int, default=0)
     ap.add_argument("--fake-latency-s", type=float, default=0.01)

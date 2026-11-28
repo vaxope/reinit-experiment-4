@@ -106,10 +106,10 @@ def test_scripts_parse():
         if f.suffix in (".sh", ".sbatch"):
             assert "/opt/slime/tools/convert_torch_dist_to_hf.py" not in f.read_text(), f.name
     bash = shutil.which("bash")
-    # (train_reinit.sbatch, setup_and_train.sbatch and eval_trained.sbatch: not ported yet, 2026-11-24)
     for name in ("build_slime.sbatch", "submit.sh", "slime_common.sh", "slime_setup.sbatch",
                  "train_inside.sh", "common.sh", "serve_and_generate.sh", "smoke_train.sh", "slime_env.sh",
-                 "diag_attention.sbatch"):
+                 "diag_attention.sbatch", "train_reinit.sbatch", "setup_and_train.sbatch", "eval_trained.sbatch",
+                 "run_control.sbatch", "smoke_test.sbatch"):
         r = subprocess.run([bash, "-n", str(REPO_ROOT / "scripts" / "deltaai" / name)], capture_output=True, text=True)
         assert r.returncode == 0, (name, r.stderr)
 

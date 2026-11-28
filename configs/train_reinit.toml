@@ -33,9 +33,10 @@ seed = 1234
 num_steps = 100
 # The control run this training is compared with: its config must have the same model, revision,
 # chat template, sampling, answer rule and SGLang kernels (src/train_args.check_against_control).
-# configs/control_4b.toml does NOT exist yet: it is written when the 4B control run pins its model
-# revision and prompts. Until then src/train_args.py refuses to build flags (by design).
-control_config = "configs/control_4b.toml"
+# configs/control.toml = the 4B control since 2026-11-27 (user: the 2B record need not be kept;
+# commit b99a7c2 on few_shot_examples); it replaces the draft configs/control_4b.toml, whose
+# settings were identical.
+control_config = "configs/control.toml"
 
 [model]
 # Starting model | user, 2026-11-22 | the same weights as the 4B control run.
@@ -326,6 +327,23 @@ params_replicated_billion = 1.0
 # Activations with full recompute + temporaries | 12 GB | ASSUMPTION (layer inputs 32 x 36,864 x
 # 2,560 x 2 bytes / TP ~ 3 GB, plus one layer recomputed at a time).
 activation_reserve_gb = 12
+
+[job]
+# How the long training job spends its Slurm time (scripts/deltaai/train_reinit.sbatch; not read
+# by slime). Ported from Experiment-3 (user, 2026-11-17), values re-estimated for the 4B on 4 GPUs.
+# Then evaluate the best saved checkpoint in the same job (scripts/deltaai/eval_trained.sbatch),
+# so the evaluation does not wait in the queue again | true | user, 2026-11-27.
+eval_after_training = true
+# Train until this many minutes are left in the job, then stop (saved checkpoints are kept) and
+# evaluate | 150 | ESTIMATE: conversion ~5 min (the smoke run prints the real time) + SGLang start
+# ~5 min + the GPQA evaluation (198 x 4 x 3 modes) + scoring. control_v1 (2B, 1 GPU) took 54 min
+# for 28.5 M output tokens; the 4B is slower per token but runs on 4 copies ([server] dp_size), and
+# the longest single answer (81,920 tokens) sets a floor. 150 leaves about 2x margin; an evaluation
+# cut by the time limit resumes when eval_trained.sbatch is resubmitted.
+eval_reserve_min = 150
+# Do not start training with less than this many minutes of budget | 30 | Experiment-3: less is
+# not worth the start-up (Ray + SGLang + Megatron load ~5-10 min) and one checkpoint interval.
+min_train_min = 30
 
 [smoke]
 # The smoke run (scripts/deltaai/smoke_train.sh): real slime training with THIS config, changed

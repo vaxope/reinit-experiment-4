@@ -130,7 +130,7 @@ def server_facts(base: str) -> dict:
             facts["sglang_version"] = info.get("version", "unknown")
             facts["server_args"] = {k: info.get(k) for k in (
                 "model_path", "revision", "dtype", "context_length", "mem_fraction_static",
-                "random_seed", "max_running_requests", "tp_size", "attention_backend",
+                "random_seed", "max_running_requests", "tp_size", "dp_size", "attention_backend",
                 "mm_attention_backend") if k in info}
             break
         except Exception as e:
@@ -306,8 +306,9 @@ def check_sglang_version(got: str | None, cfg: dict, run_id: str) -> None:
     print(f"[generate] WARNING: {msg} (allowed for a smoke test only)", flush=True)
 
 
-# Server settings that must equal [server] in the config for real runs (pinned kernels).
-PINNED_SERVER_KEYS = ("attention_backend", "mm_attention_backend")
+# Server settings that must equal [server] in the config for real runs (pinned kernels, and the
+# number of data-parallel copies, so the control and every evaluation are served the same way).
+PINNED_SERVER_KEYS = ("attention_backend", "mm_attention_backend", "dp_size")
 
 
 def check_attention_backend(server_args: dict, cfg: dict, run_id: str) -> None:
@@ -356,6 +357,11 @@ def check_run_dir(run_dir: Path, cfg: dict, model_sha256: str | None = None) -> 
     if first.get("config_sha256") != cfg["_meta"]["sha256"]:
         sys.exit(f"{run_dir} was started with config {first.get('config_sha256')}, current config is "
                  f"{cfg['_meta']['sha256']}. Use a new --run-id (CLAUDE.md Rule 3).")
+    # The prompt text lives in src/prompts.py, not in the config: a prompt edit between two job
+    # segments would otherwise mix two prompts in one run (review 2026-11-27, few-shot prompts).
+    if first.get("prompt_hash") != prompts.PROMPT_HASH:
+        sys.exit(f"{run_dir} was started with prompt hash {first.get('prompt_hash')}, src/prompts.py is now "
+                 f"{prompts.PROMPT_HASH}. Use a new --run-id (CLAUDE.md Rule 3).")
     started = (first.get("checkpoint") or {}).get("model_sha256")
     if started != model_sha256:
         sys.exit(f"{run_dir} was started with model {started}, this job serves {model_sha256}. Use a new --run-id.")

@@ -15,6 +15,11 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# The fake server serves the model configs/control.toml names, so generate.py's model check
+# passes whichever model the control run uses.
+sys.path.insert(0, str(ROOT))
+from src.config import load_config  # noqa: E402
+MODEL = load_config()["model"]
 QUESTIONS = [{"qid": f"recTEST{i:02d}", "question": f"Synthetic question {i}: pick the largest.",
               "correct": "42", "wrong": ["7", "13", "21"], "domain": "Test", "subdomain": "Test"}
              for i in range(4)]
@@ -39,8 +44,8 @@ def _free_port():
 class FakeServer:
     def __init__(self, *extra):
         self.port = _free_port()
-        self.proc = subprocess.Popen([sys.executable, "-m", "tests.fake_sglang", "--model-path", "Qwen/Qwen3.5-2B",
-                                      "--revision", "15852e8c16360a2fea060d615a32b45270f8a8fc",
+        self.proc = subprocess.Popen([sys.executable, "-m", "tests.fake_sglang", "--model-path", MODEL["name"],
+                                      "--revision", MODEL["revision"],
                                       "--port", str(self.port), "--fake-load-s", "0.5", *extra],
                                      cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.url = f"http://127.0.0.1:{self.port}"
@@ -91,7 +96,7 @@ def test_end_to_end_records_resume_and_score():
                 # the counted tokens end exactly at "</analysis>"
                 head = r["output_token_ids"][:r["n_analysis_tokens"]]
                 from transformers import AutoTokenizer
-                tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-2B", revision=r["model_revision"])
+                tok = AutoTokenizer.from_pretrained(r["model"], revision=r["model_revision"])
                 assert tok.decode(head).endswith("</analysis>")
                 assert r["input_text"].startswith("<|im_start|>system\n")
         # same (qid, sample) -> same option order and gold in every mode
@@ -235,7 +240,8 @@ def test_attention_backend_pinned_for_real_runs():
     from src.config import load_config
     cfg = load_config()
     good = {k: cfg["server"][k] for k in generate.PINNED_SERVER_KEYS}
-    assert good == {"attention_backend": "flashinfer", "mm_attention_backend": "triton_attn"}
+    assert good == {"attention_backend": "flashinfer", "mm_attention_backend": "triton_attn",
+                    "dp_size": cfg["server"]["dp_size"]}
     generate.check_attention_backend(good, cfg, "pilot_x")  # passes
     generate.check_attention_backend({"attention_backend": "fa3"}, cfg, "smoke_x")  # warns only
     for key in generate.PINNED_SERVER_KEYS:
@@ -255,7 +261,7 @@ def test_fake_server_reports_attention_backend():
     if not _have_transformers():
         return "SKIP: transformers not installed"
     from src import generate
-    with FakeServer("--attention-backend", "flashinfer", "--mm-attention-backend", "triton_attn") as srv:
+    with FakeServer("--attention-backend", "flashinfer", "--mm-attention-backend", "triton_attn", "--dp-size", "4") as srv:
         facts = {}
         for _ in range(200):
             facts = generate.server_facts(srv.url)
@@ -264,3 +270,24 @@ def test_fake_server_reports_attention_backend():
             time.sleep(0.05)
         assert facts["server_args"]["attention_backend"] == "flashinfer"
         assert facts["server_args"]["mm_attention_backend"] == "triton_attn"
+        assert facts["server_args"]["dp_size"] == 4
+
+
+def test_resume_refuses_a_run_started_with_other_prompts():
+    """The prompts live in src/prompts.py, outside the config: a run resumed after a prompt edit
+    would mix two prompts, so check_run_dir refuses it (and accepts the same prompts)."""
+    from src import generate, prompts
+    from src.config import load_config
+    cfg = load_config()
+    with tempfile.TemporaryDirectory() as d:
+        run = Path(d)
+        start = {"event": "start", "config_sha256": cfg["_meta"]["sha256"], "prompt_hash": prompts.PROMPT_HASH}
+        (run / "run_meta.jsonl").write_text(json.dumps(start) + "\n")
+        generate.check_run_dir(run, cfg)   # same config, same prompts: resumes
+        (run / "run_meta.jsonl").write_text(json.dumps(dict(start, prompt_hash="0" * 16)) + "\n")
+        try:
+            generate.check_run_dir(run, cfg)
+        except SystemExit as e:
+            assert "prompt hash" in str(e)
+        else:
+            raise AssertionError("resumed a run started with other prompts")
